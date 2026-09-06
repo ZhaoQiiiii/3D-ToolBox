@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "bbox-picker",
+      "name": "3d-bbox-tool",
       "dependencies": {
         "@react-three/drei": "^10.0.0",
         "@react-three/fiber": "^9.0.0",

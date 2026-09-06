@@ -14,7 +14,6 @@ import { CameraControls } from "./components/CameraControls";
 
 // Cap the parsed cloud to keep rendering responsive (elec.pcd is ~6.5M points).
 const PCD_MAX_POINTS = 180_000;
-const HANDLE_RADIUS = 0.18;
 const HANDLE_COLOR = "#ff5252";
 const PICK_PIXEL_RADIUS = 16;
 
@@ -28,6 +27,7 @@ function Picker({
   cornersRef,
   onPlace,
   onDrag,
+  onDragStart,
 }: {
   sceneGroupRef: RefObject<THREE.Group | null>;
   controlsRef: RefObject<any>;
@@ -36,16 +36,17 @@ function Picker({
   cornersRef: React.MutableRefObject<{ min: Vec3 | null; max: Vec3 | null }>;
   onPlace: (p: Vec3) => void;
   onDrag: (index: number, p: Vec3) => void;
+  onDragStart: () => void;
 }) {
   const { gl, camera } = useThree();
 
-  const latestRef = useRef({ onPlace, onDrag });
-  latestRef.current = { onPlace, onDrag };
+  const latestRef = useRef({ onPlace, onDrag, onDragStart });
+  latestRef.current = { onPlace, onDrag, onDragStart };
 
   const dragRef = useRef<{
     pointerId: number;
     index: number;
-    anchorZ: number;
+    plane: THREE.Plane;
     moved: boolean;
   } | null>(null);
 
@@ -86,6 +87,31 @@ function Picker({
         new THREE.Vector3(0, 1, 0),
         -worldStart.y,
       );
+
+      const { ndc } = ndcOf(clientX, clientY);
+      const raycaster = new THREE.Raycaster();
+      raycaster.setFromCamera(ndc, camera);
+      const worldHit = new THREE.Vector3();
+      const hit = raycaster.ray.intersectPlane(plane, worldHit);
+      if (!hit) return null;
+
+      const local = sceneGroup.worldToLocal(worldHit.clone());
+      return [local.x, local.y, local.z];
+    };
+
+    // Project the pointer ray onto an arbitrary world plane. This is used for
+    // corner dragging: the plane passes through the grabbed handle and faces
+    // the camera, so dragging moves the corner freely in 3D instead of only
+    // along the local horizontal XY plane.
+    const localFromRayOnPlane = (
+      clientX: number,
+      clientY: number,
+      plane: THREE.Plane,
+    ): Vec3 | null => {
+      const sceneGroup = sceneGroupRef.current;
+      if (!sceneGroup) return null;
+      sceneGroup.updateWorldMatrix(true, false);
+      camera.updateMatrixWorld();
 
       const { ndc } = ndcOf(clientX, clientY);
       const raycaster = new THREE.Raycaster();
@@ -165,19 +191,24 @@ function Picker({
 
       const mesh = handleRefs.current[idx];
       const sceneGroup = sceneGroupRef.current;
-      let anchorZ = 0;
+      let plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
       if (mesh && sceneGroup) {
         sceneGroup.updateWorldMatrix(true, false);
-        const local = sceneGroup.worldToLocal(mesh.getWorldPosition(new THREE.Vector3()));
-        anchorZ = local.z;
+        camera.updateMatrixWorld();
+        const worldPos = mesh.getWorldPosition(new THREE.Vector3());
+        const camDir = new THREE.Vector3();
+        camera.getWorldDirection(camDir);
+        plane = new THREE.Plane(camDir.clone(), -camDir.dot(worldPos));
       }
 
       dragRef.current = {
         pointerId: e.pointerId,
         index: idx,
-        anchorZ,
+        plane,
         moved: false,
       };
+
+      latestRef.current.onDragStart();
 
       if (controlsRef.current) controlsRef.current.enabled = false;
       try {
@@ -188,7 +219,7 @@ function Picker({
     const onPointerMove = (e: PointerEvent) => {
       const drag = dragRef.current;
       if (!drag || e.pointerId !== drag.pointerId) return;
-      const local = localFromRayAtZ(e.clientX, e.clientY, drag.anchorZ);
+      const local = localFromRayOnPlane(e.clientX, e.clientY, drag.plane);
       if (local) {
         drag.moved = true;
         latestRef.current.onDrag(drag.index, local);
@@ -245,19 +276,27 @@ function Picker({
 function Scene({
   positions,
   pointSize,
+  handleRadius,
+  lineWidth,
+  opacity,
   cornerMin,
   cornerMax,
   cornersRef,
   onPlace,
   onDrag,
+  onDragStart,
 }: {
   positions: Float32Array | null;
   pointSize: number;
+  handleRadius: number;
+  lineWidth: number;
+  opacity: number;
   cornerMin: Vec3 | null;
   cornerMax: Vec3 | null;
   cornersRef: React.MutableRefObject<{ min: Vec3 | null; max: Vec3 | null }>;
   onPlace: (p: Vec3) => void;
   onDrag: (index: number, p: Vec3) => void;
+  onDragStart: () => void;
 }) {
   const sceneGroupRef = useRef<THREE.Group>(null);
   const controlsRef = useRef<any>(null);
@@ -276,7 +315,7 @@ function Scene({
         {cornerMin && !cornerMax && (
           <CornerHandle
             position={cornerMin}
-            radius={HANDLE_RADIUS}
+            radius={handleRadius}
             color={HANDLE_COLOR}
             index={0}
             handleRefs={handleRefs}
@@ -287,7 +326,9 @@ function Scene({
           <BBoxLayer
             cornerMin={cornerMin}
             cornerMax={cornerMax}
-            handleRadius={HANDLE_RADIUS}
+            handleRadius={handleRadius}
+            lineWidth={lineWidth}
+            opacity={opacity}
             color={HANDLE_COLOR}
             handleRefs={handleRefs}
           />
@@ -304,6 +345,7 @@ function Scene({
         cornersRef={cornersRef}
         onPlace={onPlace}
         onDrag={onDrag}
+        onDragStart={onDragStart}
       />
     </Canvas>
   );
@@ -311,17 +353,43 @@ function Scene({
 
 // ---- app ----
 
+// Persist non-bbox display parameters across sessions (mirrors
+// scenegraph_editor's useLocalStorageState, with a 3D-BBox-Tool key prefix).
+function useLocalStorageState<T>(key: string, fallback: T): [T, (v: T) => void] {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const stored = localStorage.getItem(`3dbbox_${key}`);
+      if (stored !== null) return JSON.parse(stored) as T;
+    } catch {}
+    return fallback;
+  });
+  const set = useCallback(
+    (v: T) => {
+      setValue(v);
+      try {
+        localStorage.setItem(`3dbbox_${key}`, JSON.stringify(v));
+      } catch {}
+    },
+    [key],
+  );
+  return [value, set];
+}
+
 export function App() {
   const [positions, setPositions] = useState<Float32Array | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [pointSize, setPointSize] = useState(0.06);
+  const [pointSize, setPointSize] = useLocalStorageState<number>("pointSize", 0.06);
+  const [handleRadius, setHandleRadius] = useLocalStorageState<number>("handleRadius", 0.12);
+  const [lineWidth, setLineWidth] = useLocalStorageState<number>("lineWidth", 0.04);
+  const [opacity, setOpacity] = useLocalStorageState<number>("opacity", 0.08);
 
   const [cloudFiles, setCloudFiles] = useState<string[]>([]);
-  const [selectedCloud, setSelectedCloud] = useState<string>("elec.pcd");
+  const [selectedCloud, setSelectedCloud] = useLocalStorageState<string>("selectedCloud", "elec.pcd");
 
   const [cornerMin, setCornerMin] = useState<Vec3 | null>(null);
   const [cornerMax, setCornerMax] = useState<Vec3 | null>(null);
+  const historyRef = useRef<Array<{ min: Vec3 | null; max: Vec3 | null }>>([]);
 
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [copied, setCopied] = useState(false);
@@ -331,6 +399,41 @@ export function App() {
     max: cornerMax,
   });
   cornersRef.current = { min: cornerMin, max: cornerMax };
+
+  const pushHistory = useCallback(() => {
+    const cur = cornersRef.current;
+    historyRef.current = [...historyRef.current, { min: cur.min, max: cur.max }];
+  }, []);
+
+  const undo = useCallback(() => {
+    const h = historyRef.current;
+    if (h.length === 0) return;
+    const last = h[h.length - 1]!;
+    setCornerMin(last.min);
+    setCornerMax(last.max);
+    historyRef.current = h.slice(0, -1);
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
+        const el = e.target as HTMLElement | null;
+        if (
+          el &&
+          (el.tagName === "INPUT" ||
+            el.tagName === "TEXTAREA" ||
+            el.tagName === "SELECT" ||
+            el.isContentEditable)
+        ) {
+          return;
+        }
+        e.preventDefault();
+        undo();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [undo]);
 
   useEffect(() => {
     fetch("/api/pointcloud-files")
@@ -403,15 +506,17 @@ export function App() {
   const handlePlace = useCallback((p: Vec3) => {
     const cur = cornersRef.current;
     if (!cur.min) {
+      pushHistory();
       setCornerMin(p);
     } else if (!cur.max) {
       // The two clicks are diagonal corners in either order, so normalise
       // them into a true component-wise min/max pair.
+      pushHistory();
       const a = cur.min;
       setCornerMin(vecMin(a, p));
       setCornerMax(vecMax(a, p));
     }
-  }, []);
+  }, [pushHistory]);
 
   const handleDrag = useCallback((index: number, p: Vec3) => {
     const cur = cornersRef.current;
@@ -433,15 +538,23 @@ export function App() {
     } else {
       max[1] = cur.min ? Math.max(p[1], min[1]) : p[1];
     }
+    if (((index >> 2) & 1) === 0) {
+      min[2] = cur.max ? Math.min(p[2], max[2]) : p[2];
+    } else {
+      max[2] = cur.min ? Math.max(p[2], min[2]) : p[2];
+    }
 
     if (cur.min) setCornerMin(min);
     if (cur.max) setCornerMax(max);
   }, []);
 
   const handleReset = useCallback(() => {
+    const cur = cornersRef.current;
+    if (!cur.min && !cur.max) return;
+    pushHistory();
     setCornerMin(null);
     setCornerMax(null);
-  }, []);
+  }, [pushHistory]);
 
   const handleSelectCloud = useCallback((name: string) => {
     setSelectedCloud(name);
@@ -486,6 +599,9 @@ export function App() {
         center={center}
         size={size}
         pointSize={pointSize}
+        handleRadius={handleRadius}
+        lineWidth={lineWidth}
+        opacity={opacity}
         saveState={saveState}
         copied={copied}
         cloudFiles={cloudFiles}
@@ -493,10 +609,14 @@ export function App() {
         onSelectCloud={handleSelectCloud}
         onSetMin={setCornerMin}
         onSetMax={setCornerMax}
+        onBeginEdit={pushHistory}
         onReset={handleReset}
         onSave={handleSave}
         onCopy={handleCopy}
         onPointSize={setPointSize}
+        onHandleRadius={setHandleRadius}
+        onLineWidth={setLineWidth}
+        onOpacity={setOpacity}
       />
 
       {loading && (
@@ -538,11 +658,15 @@ export function App() {
       <Scene
         positions={positions}
         pointSize={pointSize}
+        handleRadius={handleRadius}
+        lineWidth={lineWidth}
+        opacity={opacity}
         cornerMin={cornerMin}
         cornerMax={cornerMax}
         cornersRef={cornersRef}
         onPlace={handlePlace}
         onDrag={handleDrag}
+        onDragStart={pushHistory}
       />
     </div>
   );

@@ -51,7 +51,7 @@ export function apiPlugin(): Plugin {
   const PROJECT_ROOT = join(import.meta.dirname, "..");
 
   return {
-    name: "bbox-picker-api",
+    name: "3d-bbox-tool-api",
     configureServer(server: ViteDevServer) {
       server.middlewares.use(
         "/api/pointcloud-files",

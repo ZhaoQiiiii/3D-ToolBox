@@ -1,4 +1,3 @@
-import { useMemo } from "react";
 import * as THREE from "three";
 import type { Vec3 } from "../lib/bbox";
 import { cornerPositions, boxEdges, centerOf, sizeOf } from "../lib/bbox";
@@ -8,51 +7,72 @@ interface Props {
   cornerMin: Vec3;
   cornerMax: Vec3;
   handleRadius: number;
+  lineWidth: number;
+  opacity: number;
   color: string;
   handleRefs: React.MutableRefObject<Array<THREE.Mesh | null>>;
 }
 
+const UP = new THREE.Vector3(0, 1, 0);
+
+/** A single box edge rendered as a cylinder so `lineWidth` is a real, visible thickness. */
+function EdgeCylinder({
+  start,
+  end,
+  radius,
+  color,
+}: {
+  start: Vec3;
+  end: Vec3;
+  radius: number;
+  color: string;
+}) {
+  const a = new THREE.Vector3(start[0], start[1], start[2]);
+  const b = new THREE.Vector3(end[0], end[1], end[2]);
+  const mid = a.clone().add(b).multiplyScalar(0.5);
+  const dir = b.clone().sub(a);
+  const length = dir.length();
+  const quaternion = new THREE.Quaternion().setFromUnitVectors(UP, dir.normalize());
+
+  return (
+    <mesh position={mid} quaternion={quaternion}>
+      <cylinderGeometry args={[radius, radius, length, 8]} />
+      <meshBasicMaterial color={color} />
+    </mesh>
+  );
+}
+
 /**
  * Renders an AABB derived entirely from `cornerMin` / `cornerMax`:
- * 12 edge lines, a semi-transparent fill and 8 draggable corner spheres.
+ * 12 edge cylinders, a semi-transparent fill and 8 draggable corner spheres.
  * Nothing here owns independent geometry state.
  */
-export function BBoxLayer({ cornerMin, cornerMax, handleRadius, color, handleRefs }: Props) {
+export function BBoxLayer({
+  cornerMin,
+  cornerMax,
+  handleRadius,
+  lineWidth,
+  opacity,
+  color,
+  handleRefs,
+}: Props) {
   const corners = cornerPositions(cornerMin, cornerMax);
   const edges = boxEdges();
   const center = centerOf(cornerMin, cornerMax);
   const size = sizeOf(cornerMin, cornerMax);
-
-  const linePositions = useMemo(() => {
-    const arr = new Float32Array(edges.length * 2 * 3);
-    let o = 0;
-    for (const [a, b] of edges) {
-      const ca = corners[a]!;
-      const cb = corners[b]!;
-      arr[o++] = ca[0];
-      arr[o++] = ca[1];
-      arr[o++] = ca[2];
-      arr[o++] = cb[0];
-      arr[o++] = cb[1];
-      arr[o++] = cb[2];
-    }
-    return arr;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cornerMin, cornerMax]);
+  const radius = Math.max(0.0005, lineWidth / 2);
 
   return (
     <group>
-      {/* 12 edge wireframe */}
-      <lineSegments>
-        <bufferGeometry>
-          <bufferAttribute
-            attach="attributes-position"
-            args={[linePositions, 3] as [Float32Array, number]}
-            count={edges.length * 2}
-          />
-        </bufferGeometry>
-        <lineBasicMaterial color={color} />
-      </lineSegments>
+      {edges.map(([a, b], i) => (
+        <EdgeCylinder
+          key={i}
+          start={corners[a]!}
+          end={corners[b]!}
+          radius={radius}
+          color={color}
+        />
+      ))}
 
       {/* Semi-transparent fill */}
       <mesh position={center}>
@@ -60,7 +80,7 @@ export function BBoxLayer({ cornerMin, cornerMax, handleRadius, color, handleRef
         <meshBasicMaterial
           color={color}
           transparent
-          opacity={0.08}
+          opacity={opacity}
           depthWrite={false}
           side={THREE.DoubleSide}
         />
