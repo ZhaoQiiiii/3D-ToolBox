@@ -1,0 +1,7 @@
+node_modules/
+frontend/dist/
+bbox_result.json
+logs/
+pcd/*
+!pcd/.gitkeep
+
