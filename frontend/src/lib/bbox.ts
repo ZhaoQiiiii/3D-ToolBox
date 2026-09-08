@@ -52,102 +52,35 @@ export function newBBoxId(): string {
   return `bbox_${Date.now().toString(36)}_${idCounter}`;
 }
 
-export type Axis = 0 | 1 | 2;
-export type DragKind = "corner" | "edge" | "face" | "center";
-
-/** One face value of an AABB: an axis and its min (0) or max (1) side. */
-export interface AxisSide {
-  axis: Axis;
-  side: 0 | 1;
-}
-
-/** One draggable element (corner / edge / face / center) registered for picking. */
+/** One draggable element: a single AABB corner registered for picking. */
 export interface DragEntry {
   key: string;
   boxId: string;
-  kind: DragKind;
-  pairs: AxisSide[];
+  corner: number;
   mesh: THREE.Mesh;
 }
 
-/** The face values a given corner (bitmask 0..7) controls. */
-export function cornerPairs(corner: number): AxisSide[] {
-  return [
-    { axis: 0, side: (corner & 1) as 0 | 1 },
-    { axis: 1, side: ((corner >> 1) & 1) as 0 | 1 },
-    { axis: 2, side: ((corner >> 2) & 1) as 0 | 1 },
-  ];
-}
-
-/** The face values an edge controls: the two axes its two corners share. */
-export function edgePairs(a: number, b: number): AxisSide[] {
-  const pairs: AxisSide[] = [];
-  for (let axis = 0; axis < 3; axis++) {
-    const sideA = ((a >> axis) & 1) as 0 | 1;
-    const sideB = ((b >> axis) & 1) as 0 | 1;
-    if (sideA === sideB) pairs.push({ axis: axis as Axis, side: sideA });
-  }
-  return pairs;
-}
-
-/** The single face value a face (axis + side) controls. */
-export function facePairs(axis: Axis, side: 0 | 1): AxisSide[] {
-  return [{ axis, side }];
-}
-
-/** All six face values; moving them together translates the whole box. */
-export const CENTER_PAIRS: AxisSide[] = [
-  { axis: 0, side: 0 },
-  { axis: 0, side: 1 },
-  { axis: 1, side: 0 },
-  { axis: 1, side: 1 },
-  { axis: 2, side: 0 },
-  { axis: 2, side: 1 },
-];
-
 /**
- * Apply a local-space delta to the given face values of a box. Only the axes
- * listed in `pairs` are moved; `min <= max` is preserved per axis.
+ * Move a single corner (bitmask 0..7) of an AABB to an absolute local
+ * position. The opposite corner stays fixed, and min/max are recomputed so
+ * the box remains a valid AABB (min <= max) at all times.
  */
-export function applyDrag(box: BBoxItem, pairs: AxisSide[], delta: Vec3): BBoxItem {
-  const min: Vec3 = [...box.min];
-  const max: Vec3 = [...box.max];
-  const minNext: Vec3 = [...min];
-  const maxNext: Vec3 = [...max];
-
-  for (const { axis, side } of pairs) {
-    const d = delta[axis];
-    if (side === 0) minNext[axis] = min[axis] + d;
-    else maxNext[axis] = max[axis] + d;
-  }
-
-  for (let a = 0; a < 3; a++) {
-    if (minNext[a] > maxNext[a]) {
-      const minMoved = pairs.some((p) => p.axis === a && p.side === 0);
-      const maxMoved = pairs.some((p) => p.axis === a && p.side === 1);
-      if (minMoved && !maxMoved) minNext[a] = maxNext[a];
-      else if (maxMoved && !minMoved) maxNext[a] = minNext[a];
-      else {
-        const t = minNext[a];
-        minNext[a] = maxNext[a];
-        maxNext[a] = t;
-      }
-    }
-  }
-
-  return { ...box, min: minNext, max: maxNext };
+export function moveCornerTo(box: BBoxItem, corner: number, position: Vec3): BBoxItem {
+  const opposite = corner ^ 7;
+  const oppPos = cornerPositions(box.min, box.max)[opposite]!;
+  return { ...box, min: vecMin(position, oppPos), max: vecMax(position, oppPos) };
 }
 
 /** Insert / update / remove a drag entry in the shared registry. */
 export function upsertDragEntry(
   list: DragEntry[],
   key: string,
-  entry: { boxId: string; kind: DragKind; pairs: AxisSide[] },
+  entry: { boxId: string; corner: number },
   mesh: THREE.Mesh | null,
 ): void {
   const idx = list.findIndex((h) => h.key === key);
   if (mesh) {
-    const full: DragEntry = { key, boxId: entry.boxId, kind: entry.kind, pairs: entry.pairs, mesh };
+    const full: DragEntry = { key, boxId: entry.boxId, corner: entry.corner, mesh };
     if (idx >= 0) list[idx] = full;
     else list.push(full);
   } else if (idx >= 0) {

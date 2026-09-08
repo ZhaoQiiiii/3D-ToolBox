@@ -3,10 +3,10 @@ import type { RefObject } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { PerspectiveCamera } from "@react-three/drei";
 import * as THREE from "three";
-import type { AxisSide, BBoxItem, DragEntry, DragKind, Vec3 } from "./lib/bbox";
+import type { BBoxItem, DragEntry, Vec3 } from "./lib/bbox";
 import {
-  applyDrag,
   colorForIndex,
+  moveCornerTo,
   newBBoxId,
   toBBoxOutput,
   toBboxResult,
@@ -18,19 +18,17 @@ import { PointCloudView } from "./components/PointCloudView";
 import { BBoxLayer } from "./components/BBoxLayer";
 import { BBoxPanel } from "./components/BBoxPanel";
 import { CameraControls } from "./components/CameraControls";
+import { GaussianSplatViewer } from "./components/GaussianSplatViewer";
 
 // Cap the parsed cloud to keep rendering responsive (elec.pcd is ~6.5M points).
 const PCD_MAX_POINTS = 180_000;
 
-/** Zero out delta components along axes not controlled by a drag entry. */
-function constrainDelta(delta: Vec3, pairs: AxisSide[]): Vec3 {
-  const active = [false, false, false];
-  for (const p of pairs) active[p.axis] = true;
-  return [
-    active[0] ? delta[0] : 0,
-    active[1] ? delta[1] : 0,
-    active[2] ? delta[2] : 0,
-  ];
+type RenderMode = "pointcloud" | "3dgs";
+type AssetFormat = "pcd" | "ply" | "splat" | "ksplat" | "spz";
+
+function detectFormat(name: string): AssetFormat | null {
+  const m = /\.(pcd|ply|splat|ksplat|spz)$/i.exec(name);
+  return m ? (m[1].toLowerCase() as AssetFormat) : null;
 }
 
 /** Rebuild a labelled-box list from the backend payload (new or legacy shape). */
@@ -90,7 +88,6 @@ function Picker({
   controlsRef,
   pointsRef,
   dragRefs,
-  boxBodyRefs,
   anchorZRef,
   onPlace,
   onDrag,
@@ -101,10 +98,9 @@ function Picker({
   controlsRef: RefObject<any>;
   pointsRef: RefObject<THREE.Points | null>;
   dragRefs: React.MutableRefObject<DragEntry[]>;
-  boxBodyRefs: React.MutableRefObject<{ boxId: string; mesh: THREE.Mesh }[]>;
   anchorZRef: React.MutableRefObject<number>;
   onPlace: (p: Vec3) => void;
-  onDrag: (boxId: string, pairs: AxisSide[], delta: Vec3) => void;
+  onDrag: (boxId: string, corner: number, position: Vec3) => void;
   onDragStart: (boxId: string) => void;
   onSelectBox: (boxId: string) => void;
 }) {
@@ -116,8 +112,8 @@ function Picker({
   const dragRef = useRef<{
     pointerId: number;
     boxId: string;
-    pairs: AxisSide[];
-    plane: THREE.Plane;
+    corner: number;
+    button: number;
     startLocal: Vec3;
     moved: boolean;
   } | null>(null);
@@ -127,23 +123,22 @@ function Picker({
     const mouseDown = new THREE.Vector2();
     const mouseUp = new THREE.Vector2();
     const downBoxIdRef = { current: null as string | null };
+    // Shared objects reused across pointer moves (hot path).
+    const sharedRaycaster = new THREE.Raycaster();
+    const sharedNdc = new THREE.Vector2();
 
     const ndcOf = (clientX: number, clientY: number) => {
       const rect = canvas.getBoundingClientRect();
-      return {
-        rect,
-        ndc: new THREE.Vector2(
-          ((clientX - rect.left) / rect.width) * 2 - 1,
-          -((clientY - rect.top) / rect.height) * 2 + 1,
-        ),
-      };
+      sharedNdc.set(
+        ((clientX - rect.left) / rect.width) * 2 - 1,
+        -((clientY - rect.top) / rect.height) * 2 + 1,
+      );
+      return sharedNdc;
     };
 
     const raycasterFrom = (clientX: number, clientY: number) => {
-      const { ndc } = ndcOf(clientX, clientY);
-      const raycaster = new THREE.Raycaster();
-      raycaster.setFromCamera(ndc, camera);
-      return raycaster;
+      sharedRaycaster.setFromCamera(ndcOf(clientX, clientY), camera);
+      return sharedRaycaster;
     };
 
     // Project the pointer ray onto the point-cloud local horizontal plane
@@ -173,24 +168,95 @@ function Picker({
       return [local.x, local.y, local.z];
     };
 
-    // Project the pointer ray onto an arbitrary world plane (camera-facing),
-    // then convert the hit back into point-cloud local space.
-    const localFromRayOnPlane = (
+    // Project the pointer ray onto the horizontal ground plane at the dragged
+    // point's current height, then map back to scene-local coordinates. This
+    // mirrors scenegraph_editor's node/object drag exactly: the height stays
+    // fixed while the point follows the cursor 1:1 across the floor, avoiding
+    // the depth amplification of a camera-facing plane.
+    const groundLocalAt = (
       clientX: number,
       clientY: number,
-      plane: THREE.Plane,
+      startLocal: Vec3,
     ): Vec3 | null => {
       const sceneGroup = sceneGroupRef.current;
       if (!sceneGroup) return null;
       sceneGroup.updateWorldMatrix(true, false);
       camera.updateMatrixWorld();
 
+      const worldStart = new THREE.Vector3(
+        startLocal[0],
+        startLocal[1],
+        startLocal[2],
+      ).applyMatrix4(sceneGroup.matrixWorld);
+      const plane = new THREE.Plane(
+        new THREE.Vector3(0, 1, 0),
+        -worldStart.y,
+      );
+
+      const raycaster = raycasterFrom(clientX, clientY);
+      const worldCurrent = new THREE.Vector3();
+      const hit = raycaster.ray.intersectPlane(plane, worldCurrent);
+      if (!hit) return null;
+
+      const localCurrent = sceneGroup.worldToLocal(worldCurrent.clone());
+      return [localCurrent.x, localCurrent.y, localCurrent.z];
+    };
+
+    // Vertical (right-button) drag: keep the corner's scene-local X/Y fixed and
+    // move only its height (local Z). We work in world space where up is +Y,
+    // intersect a camera-facing vertical plane through the anchor, then map the
+    // changed world-Y back to scene-local coordinates.
+    const verticalLocalAt = (
+      clientX: number,
+      clientY: number,
+      startLocal: Vec3,
+    ): Vec3 | null => {
+      const sceneGroup = sceneGroupRef.current;
+      if (!sceneGroup) return null;
+      sceneGroup.updateWorldMatrix(true, false);
+      camera.updateMatrixWorld();
+
+      const worldStart = new THREE.Vector3(
+        startLocal[0],
+        startLocal[1],
+        startLocal[2],
+      ).applyMatrix4(sceneGroup.matrixWorld);
+
+      const cameraDir = camera.getWorldDirection(new THREE.Vector3());
+      const horiz = new THREE.Vector3(cameraDir.x, 0, cameraDir.z);
+
+      // Near-top-down camera: a vertical plane becomes degenerate, so map the
+      // screen-space Y delta straight onto the world up axis instead.
+      if (horiz.lengthSq() < 0.04) {
+        const cam = camera as THREE.PerspectiveCamera;
+        const rect = canvas.getBoundingClientRect();
+        const dist = cam.position.distanceTo(worldStart);
+        const worldPerPixel =
+          (2 * Math.tan((cam.fov * Math.PI) / 360) * dist) / rect.height;
+        const proj = worldStart.clone().project(cam);
+        const anchorClientY = rect.top + (1 - (proj.y + 1) / 2) * rect.height;
+        const dy = clientY - anchorClientY;
+        const newWorld = new THREE.Vector3(
+          worldStart.x,
+          worldStart.y - dy * worldPerPixel,
+          worldStart.z,
+        );
+        const local = sceneGroup.worldToLocal(newWorld);
+        return [local.x, local.y, local.z];
+      }
+
+      horiz.normalize();
+      const up = new THREE.Vector3(0, 1, 0);
+      const normal = new THREE.Vector3().crossVectors(up, horiz).normalize();
+      const plane = new THREE.Plane(normal, -normal.dot(worldStart));
+
       const raycaster = raycasterFrom(clientX, clientY);
       const worldHit = new THREE.Vector3();
       const hit = raycaster.ray.intersectPlane(plane, worldHit);
       if (!hit) return null;
 
-      const local = sceneGroup.worldToLocal(worldHit.clone());
+      const newWorld = new THREE.Vector3(worldStart.x, worldHit.y, worldStart.z);
+      const local = sceneGroup.worldToLocal(newWorld);
       return [local.x, local.y, local.z];
     };
 
@@ -217,80 +283,52 @@ function Picker({
       return localFromRayAtZ(clientX, clientY, anchorZLocal);
     };
 
-    // Pick a draggable element. Corners and the center handle win over edges
-    // and faces so the small spheres stay grabbable through the invisible
-    // face/edge planes; faces are the broadest fallback.
+    // Pick a draggable corner sphere (the only grab targets).
     const dragAt = (raycaster: THREE.Raycaster): DragEntry | null => {
       const entries = dragRefs.current;
       if (entries.length === 0) return null;
       const byMesh = new Map<THREE.Object3D, DragEntry>();
       for (const e of entries) byMesh.set(e.mesh, e);
 
-      const pick = (kind: DragKind): DragEntry | null => {
-        const meshes = entries.filter((e) => e.kind === kind).map((e) => e.mesh);
-        if (meshes.length === 0) return null;
-        const hits = raycaster.intersectObjects(meshes, false);
-        for (const h of hits) {
-          const entry = byMesh.get(h.object);
-          if (entry) return entry;
-        }
-        return null;
-      };
-
-      return pick("corner") ?? pick("center") ?? pick("edge") ?? pick("face");
-    };
-
-    // Fallback pick against the semi-transparent box bodies (used to select a
-    // box when the pointer lands on its fill rather than a handle/face).
-    const bodyAt = (raycaster: THREE.Raycaster): string | null => {
-      const bodies = boxBodyRefs.current;
-      if (bodies.length === 0) return null;
       const hits = raycaster.intersectObjects(
-        bodies.map((b) => b.mesh),
+        entries.map((e) => e.mesh),
         false,
       );
-      if (hits.length === 0) return null;
-      const found = bodies.find((b) => b.mesh === hits[0]!.object);
-      return found ? found.boxId : null;
+      for (const h of hits) {
+        const entry = byMesh.get(h.object);
+        if (entry) return entry;
+      }
+      return null;
     };
 
     const onPointerDown = (e: PointerEvent) => {
       mouseDown.set(e.clientX, e.clientY);
       downBoxIdRef.current = null;
 
+      // Only left (horizontal) and right (vertical) buttons drag a corner.
+      if (e.button !== 0 && e.button !== 2) return;
+
       const sceneGroup = sceneGroupRef.current;
       const raycaster = raycasterFrom(e.clientX, e.clientY);
       const entry = dragAt(raycaster);
 
-      if (!entry) {
-        downBoxIdRef.current = bodyAt(raycaster);
-        return;
-      }
+      if (!entry) return;
 
-      // Dragging moves within a camera-facing plane through the grabbed
-      // element, so corner/center translate freely in 3D while edges/faces
-      // are later constrained to their controlled axes by `constrainDelta`.
-      let plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+      // Anchor the drag at the grabbed element's local position. Horizontal
+      // drags follow the ground plane, vertical drags follow the up axis.
       let startLocal: Vec3 = [0, 0, 0];
       if (sceneGroup) {
         sceneGroup.updateWorldMatrix(true, false);
-        camera.updateMatrixWorld();
         const worldPos = entry.mesh.getWorldPosition(new THREE.Vector3());
-        const camDir = new THREE.Vector3();
-        camera.getWorldDirection(camDir);
-        plane = new THREE.Plane(camDir.clone(), -camDir.dot(worldPos));
-        const worldHit = new THREE.Vector3();
-        if (raycaster.ray.intersectPlane(plane, worldHit)) {
-          const local = sceneGroup.worldToLocal(worldHit.clone());
-          startLocal = [local.x, local.y, local.z];
-        }
+        const local = sceneGroup.worldToLocal(worldPos);
+        startLocal = [local.x, local.y, local.z];
       }
 
       dragRef.current = {
         pointerId: e.pointerId,
         boxId: entry.boxId,
-        pairs: entry.pairs,
-        plane,
+        corner: entry.corner,
+        button: e.button,
         startLocal,
         moved: false,
       };
@@ -307,15 +345,13 @@ function Picker({
     const onPointerMove = (e: PointerEvent) => {
       const drag = dragRef.current;
       if (!drag || e.pointerId !== drag.pointerId) return;
-      const local = localFromRayOnPlane(e.clientX, e.clientY, drag.plane);
+      const local =
+        drag.button === 2
+          ? verticalLocalAt(e.clientX, e.clientY, drag.startLocal)
+          : groundLocalAt(e.clientX, e.clientY, drag.startLocal);
       if (local) {
         drag.moved = true;
-        const delta: Vec3 = [
-          local[0] - drag.startLocal[0],
-          local[1] - drag.startLocal[1],
-          local[2] - drag.startLocal[2],
-        ];
-        latestRef.current.onDrag(drag.boxId, drag.pairs, constrainDelta(delta, drag.pairs));
+        latestRef.current.onDrag(drag.boxId, drag.corner, local);
       }
     };
 
@@ -329,6 +365,11 @@ function Picker({
           canvas.releasePointerCapture(e.pointerId);
         }
       } catch {}
+    };
+
+    // Suppress the browser context menu during a right-button corner drag.
+    const onContextMenu = (e: MouseEvent) => {
+      if (dragRef.current && dragRef.current.button === 2) e.preventDefault();
     };
 
     const onClick = (e: MouseEvent) => {
@@ -352,6 +393,7 @@ function Picker({
     canvas.addEventListener("pointerup", finishDrag, { capture: true });
     canvas.addEventListener("pointercancel", finishDrag, { capture: true });
     canvas.addEventListener("click", onClick, { capture: true });
+    canvas.addEventListener("contextmenu", onContextMenu, { capture: true });
 
     return () => {
       canvas.removeEventListener("pointerdown", onPointerDown, { capture: true });
@@ -359,10 +401,11 @@ function Picker({
       canvas.removeEventListener("pointerup", finishDrag, { capture: true });
       canvas.removeEventListener("pointercancel", finishDrag, { capture: true });
       canvas.removeEventListener("click", onClick, { capture: true });
+      canvas.removeEventListener("contextmenu", onContextMenu, { capture: true });
       if (dragRef.current && controlsRef.current) controlsRef.current.enabled = true;
       dragRef.current = null;
     };
-  }, [gl, camera, sceneGroupRef, controlsRef, pointsRef, dragRefs, boxBodyRefs, anchorZRef]);
+  }, [gl, camera, sceneGroupRef, controlsRef, pointsRef, dragRefs, anchorZRef]);
 
   return null;
 }
@@ -396,7 +439,7 @@ function Scene({
   draftMin: Vec3 | null;
   anchorZRef: React.MutableRefObject<number>;
   onPlace: (p: Vec3) => void;
-  onDrag: (boxId: string, pairs: AxisSide[], delta: Vec3) => void;
+  onDrag: (boxId: string, corner: number, position: Vec3) => void;
   onDragStart: (boxId: string) => void;
   onSelectBox: (boxId: string) => void;
 }) {
@@ -404,7 +447,13 @@ function Scene({
   const controlsRef = useRef<any>(null);
   const pointsRef = useRef<THREE.Points>(null);
   const dragRefs = useRef<DragEntry[]>([]);
-  const boxBodyRefs = useRef<{ boxId: string; mesh: THREE.Mesh }[]>([]);
+
+  // While placing a new box, right-drag on empty space must not pan the camera
+  // (right button is reserved for vertical corner drags).
+  useEffect(() => {
+    const c = controlsRef.current;
+    if (c) c.mouseButtons = { ...c.mouseButtons, RIGHT: placing ? null : THREE.MOUSE.PAN };
+  }, [placing]);
 
   const draftColor = colorForIndex(boxes.length);
 
@@ -429,7 +478,6 @@ function Scene({
             color={colorForIndex(i)}
             active={box.id === activeId}
             dragRefs={dragRefs}
-            boxBodyRefs={boxBodyRefs}
           />
         ))}
 
@@ -448,7 +496,6 @@ function Scene({
         controlsRef={controlsRef}
         pointsRef={pointsRef}
         dragRefs={dragRefs}
-        boxBodyRefs={boxBodyRefs}
         anchorZRef={anchorZRef}
         onPlace={onPlace}
         onDrag={onDrag}
@@ -493,7 +540,28 @@ export function App() {
   const [opacity, setOpacity] = useLocalStorageState<number>("opacity", 0.08);
 
   const [cloudFiles, setCloudFiles] = useState<string[]>([]);
-  const [selectedCloud, setSelectedCloud] = useLocalStorageState<string>("selectedCloud", "elec.pcd");
+  const [selectedCloud, setSelectedCloud] = useLocalStorageState<string>("selectedCloud", "elec.ply");
+  const [renderMode, setRenderMode] = useState<RenderMode>("pointcloud");
+  const [imported, setImported] = useState<{ name: string; url: string; format: AssetFormat } | null>(null);
+  const importedUrlRef = useRef<string | null>(null);
+
+  // The asset currently being edited: a locally imported file (not persisted
+  // to localStorage) or the server-side cloud selected in the dropdown.
+  const activeName = imported?.name ?? selectedCloud;
+  const activeNameRef = useRef(activeName);
+  activeNameRef.current = activeName;
+  const selectedCloudRef = useRef(selectedCloud);
+  selectedCloudRef.current = selectedCloud;
+
+  const activeAssetFormat: AssetFormat = imported?.format ?? detectFormat(selectedCloud) ?? "ply";
+  const activeAssetUrl = imported
+    ? imported.url
+    : `/api/pcd?name=${encodeURIComponent(selectedCloud)}`;
+  const canRender3dgs =
+    activeAssetFormat === "ply" ||
+    activeAssetFormat === "splat" ||
+    activeAssetFormat === "ksplat" ||
+    activeAssetFormat === "spz";
 
   const [boxes, setBoxes] = useState<BBoxItem[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -519,13 +587,16 @@ export function App() {
   const anchorZRef = useRef(0);
   anchorZRef.current = draftMin ? draftMin[2] : 0;
 
+  const HISTORY_LIMIT = 100;
+
   const pushHistory = useCallback(() => {
     const snap = boxesRef.current.map((b) => ({
       ...b,
       min: [...b.min] as Vec3,
       max: [...b.max] as Vec3,
     }));
-    historyRef.current = [...historyRef.current, snap];
+    // Cap history so long sessions don't accumulate unbounded snapshots.
+    historyRef.current = [...historyRef.current, snap].slice(-HISTORY_LIMIT);
   }, []);
 
   const undo = useCallback(() => {
@@ -567,20 +638,41 @@ export function App() {
           .map((f) => f.name)
           .filter((n) => /\.(pcd|ply)$/i.test(n));
         setCloudFiles(files);
+        // A stale persisted selection (file since deleted / never existed)
+        // would 404 on load; fall back to the first available cloud.
+        if (files.length > 0 && !files.includes(selectedCloudRef.current)) {
+          setSelectedCloud(files[0]!);
+        }
       })
       .catch(() => {});
   }, []);
 
   useEffect(() => {
+    return () => {
+      if (importedUrlRef.current) {
+        URL.revokeObjectURL(importedUrlRef.current);
+        importedUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (renderMode !== "pointcloud") return;
+    const format = activeAssetFormat;
+    if (format !== "pcd" && format !== "ply") {
+      setPositions(null);
+      setLoading(false);
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     setError(null);
     (async () => {
       try {
-        const url = `/api/pcd?name=${encodeURIComponent(selectedCloud)}`;
-        const result = /\.ply$/i.test(selectedCloud)
-          ? await loadPly(url, PCD_MAX_POINTS)
-          : await loadPcd(url, PCD_MAX_POINTS);
+        const result =
+          format === "ply"
+            ? await loadPly(activeAssetUrl, PCD_MAX_POINTS)
+            : await loadPcd(activeAssetUrl, PCD_MAX_POINTS);
         if (!cancelled) {
           setPositions(result.positions);
           setLoading(false);
@@ -595,22 +687,23 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedCloud]);
+  }, [activeAssetUrl, activeAssetFormat, renderMode]);
 
-  // Auto-load saved boxes for the currently selected cloud (if one exists).
+  // Auto-load saved boxes for the currently active asset (if one exists).
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const resp = await fetch(`/api/bbox?name=${encodeURIComponent(selectedCloud)}`);
+        const resp = await fetch(`/api/bbox?name=${encodeURIComponent(activeName)}`);
         if (resp.status === 404) return;
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
         if (cancelled) return;
+        // The user already started editing (slow fetch): never clobber it.
+        if (dirtyRef.current) return;
         const loaded = parseBoxes(data);
         setBoxes(loaded);
         setActiveId(loaded[0]?.id ?? null);
-        setPlacing(false);
         setDraftMin(null);
         historyRef.current = [];
         dirtyRef.current = false;
@@ -621,12 +714,28 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedCloud]);
+  }, [activeName]);
 
   const activeBox = useMemo(
     () => boxes.find((b) => b.id === activeId) ?? null,
     [boxes, activeId],
   );
+
+  // Keep the render mode compatible with the active asset: .pcd can only be
+  // a point cloud, splat-only formats can only be 3DGS. Without this, going
+  // back from 3DGS to a .pcd file strands the UI on the "unsupported" notice.
+  useEffect(() => {
+    if (activeAssetFormat === "pcd" && renderMode === "3dgs") {
+      setRenderMode("pointcloud");
+    } else if (
+      (activeAssetFormat === "splat" ||
+        activeAssetFormat === "ksplat" ||
+        activeAssetFormat === "spz") &&
+      renderMode === "pointcloud"
+    ) {
+      setRenderMode("3dgs");
+    }
+  }, [activeAssetFormat, renderMode]);
 
   const result = useMemo(
     () => (activeBox ? toBboxResult(activeBox.min, activeBox.max) : null),
@@ -648,9 +757,10 @@ export function App() {
     [boxes],
   );
 
-  // Console output matching the old script's ~1/3 Hz throttle.
+  // Console output matching the old script's ~1/3 Hz throttle (dev only —
+  // printing the full JSON every 3s would flood a production console).
   useEffect(() => {
-    if (boxes.length === 0) return;
+    if (!import.meta.env.DEV || boxes.length === 0) return;
     console.log(json);
     const id = window.setInterval(() => {
       console.log(json);
@@ -668,7 +778,13 @@ export function App() {
         pushHistory();
         dirtyRef.current = true;
         const id = newBBoxId();
-        const label = `object_${boxesRef.current.length + 1}`;
+        // Number past the highest existing object_N label so undo/delete
+        // followed by a new box doesn't produce duplicate labels.
+        const nextNum = boxesRef.current.reduce((m, b) => {
+          const mm = /^object_(\d+)$/.exec(b.label);
+          return mm ? Math.max(m, Number(mm[1])) : m;
+        }, 0) + 1;
+        const label = `object_${nextNum}`;
         const box: BBoxItem = { id, label, min: vecMin(draft, p), max: vecMax(draft, p) };
         setBoxes((prev) => [...prev, box]);
         setActiveId(id);
@@ -679,9 +795,9 @@ export function App() {
     [pushHistory],
   );
 
-  const handleDrag = useCallback((boxId: string, pairs: AxisSide[], delta: Vec3) => {
+  const handleDrag = useCallback((boxId: string, corner: number, position: Vec3) => {
     setBoxes((prev) =>
-      prev.map((b) => (b.id === boxId ? applyDrag(b, pairs, delta) : b)),
+      prev.map((b) => (b.id === boxId ? moveCornerTo(b, corner, position) : b)),
     );
   }, []);
 
@@ -701,10 +817,26 @@ export function App() {
     setDraftMin(null);
   }, []);
 
-  const handleRename = useCallback((id: string, label: string) => {
+  // Panel-edit interactions (stepper clicks, keystroke bursts) each fire a
+  // begin event; coalesce history snapshots taken within a short window so
+  // undo rolls back the whole burst instead of every 0.01 step.
+  const lastPanelEditRef = useRef(0);
+  const beginPanelEdit = useCallback(() => {
+    const now = Date.now();
+    if (now - lastPanelEditRef.current > 1000) {
+      pushHistory();
+      lastPanelEditRef.current = now;
+    }
     dirtyRef.current = true;
-    setBoxes((prev) => prev.map((b) => (b.id === id ? { ...b, label } : b)));
-  }, []);
+  }, [pushHistory]);
+
+  const handleRename = useCallback(
+    (id: string, label: string) => {
+      beginPanelEdit();
+      setBoxes((prev) => prev.map((b) => (b.id === id ? { ...b, label } : b)));
+    },
+    [beginPanelEdit],
+  );
 
   const handleDelete = useCallback(
     (id: string) => {
@@ -726,32 +858,109 @@ export function App() {
     setDraftMin(null);
   }, [pushHistory]);
 
-  const handleBeginEdit = useCallback(() => {
-    pushHistory();
-    dirtyRef.current = true;
-  }, [pushHistory]);
-
   const handleSetMin = useCallback((v: Vec3) => {
     const id = activeIdRef.current;
     if (!id) return;
-    setBoxes((prev) => prev.map((b) => (b.id === id ? { ...b, min: [...v] as Vec3 } : b)));
+    setBoxes((prev) =>
+      prev.map((b) =>
+        b.id === id
+          ? // Keep the min<=max invariant: values beyond the opposite corner
+            // extend/flip the box instead of producing a negative-size AABB.
+            { ...b, min: vecMin(v, b.max), max: vecMax(v, b.max) }
+          : b,
+      ),
+    );
   }, []);
 
   const handleSetMax = useCallback((v: Vec3) => {
     const id = activeIdRef.current;
     if (!id) return;
-    setBoxes((prev) => prev.map((b) => (b.id === id ? { ...b, max: [...v] as Vec3 } : b)));
+    setBoxes((prev) =>
+      prev.map((b) =>
+        b.id === id
+          ? { ...b, min: vecMin(v, b.min), max: vecMax(v, b.min) }
+          : b,
+      ),
+    );
   }, []);
 
-  const handleSelectCloud = useCallback((name: string) => {
-    setSelectedCloud(name);
-    setBoxes([]);
-    setActiveId(null);
-    setPlacing(false);
-    setDraftMin(null);
-    historyRef.current = [];
-    dirtyRef.current = false;
+  const persistBoxes = useCallback(async (name: string, list: BBoxItem[]) => {
+    const resp = await fetch("/api/bbox", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, boxes: list.map(toBBoxOutput) }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   }, []);
+
+  // Serialized save queue: concurrent POSTs could land out of order and roll
+  // the file back to an older snapshot, so every save chains onto the last.
+  const saveChainRef = useRef<Promise<void>>(Promise.resolve());
+  const enqueueSave = useCallback(
+    (name: string, list: BBoxItem[]) => {
+      saveChainRef.current = saveChainRef.current
+        .then(() => persistBoxes(name, list))
+        .catch(() => {
+          // Surface auto-save failures instead of swallowing them.
+          setSaveState("error");
+          window.setTimeout(() => setSaveState("idle"), 2000);
+        });
+      return saveChainRef.current;
+    },
+    [persistBoxes],
+  );
+
+  const handleSelectCloud = useCallback(
+    (name: string) => {
+      // Flush any edits still inside the debounce window to the OLD asset
+      // before switching, so they are not silently dropped.
+      if (dirtyRef.current && boxesRef.current.length > 0) {
+        void enqueueSave(activeNameRef.current, boxesRef.current);
+      }
+      setSelectedCloud(name);
+      if (importedUrlRef.current) {
+        URL.revokeObjectURL(importedUrlRef.current);
+        importedUrlRef.current = null;
+      }
+      setImported(null);
+      setBoxes([]);
+      setActiveId(null);
+      setPlacing(false);
+      setDraftMin(null);
+      historyRef.current = [];
+      dirtyRef.current = false;
+    },
+    [enqueueSave],
+  );
+
+  const handleImportFile = useCallback(
+    (file: File) => {
+      const format = detectFormat(file.name);
+      if (!format) {
+        setError("不支持的文件类型（仅 .pcd/.ply/.splat/.ksplat/.spz）");
+        return;
+      }
+      // Flush pending edits of the previous asset before switching.
+      if (dirtyRef.current && boxesRef.current.length > 0) {
+        void enqueueSave(activeNameRef.current, boxesRef.current);
+      }
+      if (importedUrlRef.current) URL.revokeObjectURL(importedUrlRef.current);
+      const url = URL.createObjectURL(file);
+      importedUrlRef.current = url;
+
+      // Keep selectedCloud untouched (it stays a server file); the imported
+      // file is tracked separately so it is not persisted to localStorage.
+      setImported({ name: file.name, url, format });
+      setBoxes([]);
+      setActiveId(null);
+      setPlacing(false);
+      setDraftMin(null);
+      historyRef.current = [];
+      dirtyRef.current = false;
+      setError(null);
+    },
+    [enqueueSave],
+  );
 
   const handleCopy = useCallback(async () => {
     if (!json) return;
@@ -764,36 +973,27 @@ export function App() {
     }
   }, [json]);
 
-  const persistBoxes = useCallback(async (name: string, list: BBoxItem[]) => {
-    const resp = await fetch("/api/bbox", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, boxes: list.map(toBBoxOutput) }),
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  }, []);
-
   const handleSave = useCallback(async () => {
     if (boxesRef.current.length === 0) return;
     setSaveState("saving");
     try {
-      await persistBoxes(selectedCloud, boxesRef.current);
+      await enqueueSave(activeNameRef.current, boxesRef.current);
       setSaveState("saved");
       window.setTimeout(() => setSaveState("idle"), 2000);
     } catch {
       setSaveState("error");
       window.setTimeout(() => setSaveState("idle"), 2000);
     }
-  }, [selectedCloud, persistBoxes]);
+  }, [enqueueSave]);
 
   // Debounced auto-save: persist after the user finishes editing.
   useEffect(() => {
     if (!dirtyRef.current) return;
     const id = window.setTimeout(() => {
-      void persistBoxes(selectedCloud, boxesRef.current).catch(() => {});
+      void enqueueSave(activeNameRef.current, boxesRef.current);
     }, 600);
     return () => window.clearTimeout(id);
-  }, [boxes, selectedCloud, persistBoxes]);
+  }, [boxes, enqueueSave]);
 
   return (
     <div style={{ width: "100%", height: "100%", position: "relative" }}>
@@ -812,11 +1012,14 @@ export function App() {
         saveState={saveState}
         copied={copied}
         cloudFiles={cloudFiles}
-        selectedCloud={selectedCloud}
+        selectedCloud={activeName}
+        renderMode={renderMode}
+        onRenderMode={setRenderMode}
+        onImportFile={handleImportFile}
         onSelectCloud={handleSelectCloud}
         onSetMin={handleSetMin}
         onSetMax={handleSetMax}
-        onBeginEdit={handleBeginEdit}
+        onBeginEdit={beginPanelEdit}
         onReset={handleReset}
         onSave={handleSave}
         onCopy={handleCopy}
@@ -830,7 +1033,7 @@ export function App() {
         onDeleteBox={handleDelete}
       />
 
-      {loading && (
+      {renderMode === "pointcloud" && loading && (
         <div
           style={{
             position: "absolute",
@@ -847,7 +1050,7 @@ export function App() {
         </div>
       )}
 
-      {error && (
+      {renderMode === "pointcloud" && error && (
         <div
           style={{
             position: "absolute",
@@ -866,22 +1069,58 @@ export function App() {
         </div>
       )}
 
-      <Scene
-        positions={positions}
-        pointSize={pointSize}
-        handleRadius={handleRadius}
-        lineWidth={lineWidth}
-        opacity={opacity}
-        boxes={boxes}
-        activeId={activeId}
-        placing={placing}
-        draftMin={draftMin}
-        anchorZRef={anchorZRef}
-        onPlace={handlePlace}
-        onDrag={handleDrag}
-        onDragStart={handleDragStart}
-        onSelectBox={handleSelectBox}
-      />
+      {renderMode === "3dgs" ? (
+        canRender3dgs ? (
+          <GaussianSplatViewer
+            src={activeAssetUrl}
+            format={activeAssetFormat as "ply" | "splat" | "ksplat" | "spz"}
+            boxes={boxes}
+            activeId={activeId}
+            placing={placing}
+            draftMin={draftMin}
+            handleRadius={handleRadius}
+            lineWidth={lineWidth}
+            opacity={opacity}
+            anchorZRef={anchorZRef}
+            onPlace={handlePlace}
+            onDrag={handleDrag}
+            onDragStart={handleDragStart}
+            onSelectBox={handleSelectBox}
+          />
+        ) : (
+          <div
+            style={{
+              position: "absolute",
+              top: "50%",
+              left: "50%",
+              transform: "translate(-50%,-50%)",
+              color: "#888",
+              fontFamily: "monospace",
+              fontSize: 14,
+              pointerEvents: "none",
+            }}
+          >
+            当前文件（.{activeAssetFormat}）不支持 3DGS 渲染，请选择 .ply / .splat / .ksplat / .spz 文件
+          </div>
+        )
+      ) : (
+        <Scene
+          positions={positions}
+          pointSize={pointSize}
+          handleRadius={handleRadius}
+          lineWidth={lineWidth}
+          opacity={opacity}
+          boxes={boxes}
+          activeId={activeId}
+          placing={placing}
+          draftMin={draftMin}
+          anchorZRef={anchorZRef}
+          onPlace={handlePlace}
+          onDrag={handleDrag}
+          onDragStart={handleDragStart}
+          onSelectBox={handleSelectBox}
+        />
+      )}
     </div>
   );
 }

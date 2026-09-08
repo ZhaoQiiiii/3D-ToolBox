@@ -48,6 +48,9 @@ interface Props {
   copied: boolean;
   cloudFiles: string[];
   selectedCloud: string;
+  renderMode: "pointcloud" | "3dgs";
+  onRenderMode: (mode: "pointcloud" | "3dgs") => void;
+  onImportFile: (file: File) => void;
   onSelectCloud: (name: string) => void;
   onSetMin: (v: Vec3) => void;
   onSetMax: (v: Vec3) => void;
@@ -294,6 +297,9 @@ export function BBoxPanel({
   copied,
   cloudFiles,
   selectedCloud,
+  renderMode,
+  onRenderMode,
+  onImportFile,
   onSelectCloud,
   onSetMin,
   onSetMax,
@@ -313,6 +319,7 @@ export function BBoxPanel({
   const cloudOptions = cloudFiles.includes(selectedCloud)
     ? cloudFiles
     : [selectedCloud, ...cloudFiles];
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   return (
     <div data-overlay style={PANEL_STYLE}>
@@ -343,6 +350,49 @@ export function BBoxPanel({
               </option>
             ))}
           </select>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+          <span style={labelStyle}>渲染模式</span>
+          <select
+            value={renderMode}
+            onChange={(e) => onRenderMode(e.target.value as "pointcloud" | "3dgs")}
+            style={{
+              flex: 1,
+              background: "#1a1a2e",
+              color: "#ddd",
+              border: "1px solid #555",
+              borderRadius: 4,
+              padding: "4px 6px",
+              fontFamily: "monospace",
+              fontSize: 13,
+            }}
+          >
+            <option value="pointcloud">Point Cloud</option>
+            <option value="3dgs">Gaussian Splatting</option>
+          </select>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+          <span style={labelStyle}>本地导入</span>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".ply,.pcd,.splat,.ksplat"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) onImportFile(file);
+              e.target.value = "";
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            style={importBtnStyle}
+          >
+            选择文件…
+          </button>
         </div>
 
         <SizeControl
@@ -520,6 +570,18 @@ const valueRowStyle: React.CSSProperties = {
 };
 
 const btnStyle: React.CSSProperties = {
+  flex: 1,
+  background: "#1a1a2e",
+  color: "#ddd",
+  border: "1px solid #555",
+  borderRadius: 4,
+  padding: "4px 0",
+  cursor: "pointer",
+  fontFamily: "monospace",
+  fontSize: 12,
+};
+
+const importBtnStyle: React.CSSProperties = {
   flex: 1,
   background: "#1a1a2e",
   color: "#ddd",

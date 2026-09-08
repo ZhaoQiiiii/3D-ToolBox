@@ -13,10 +13,22 @@ import { join, dirname } from "node:path";
 
 // ---- helpers ----
 
+/** Reject bodies larger than this so a hostile payload can't OOM the dev server. */
+const MAX_BODY_BYTES = 10 * 1024 * 1024;
+
 async function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = "";
-    req.on("data", (chunk: Buffer) => (data += chunk.toString()));
+    let size = 0;
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error("Payload too large"));
+        req.destroy();
+        return;
+      }
+      data += chunk.toString();
+    });
     req.on("end", () => resolve(data));
     req.on("error", reject);
   });
@@ -46,6 +58,29 @@ function isValidFileName(name: unknown): name is string {
   );
 }
 
+/** Any asset extension the tool knows (used for bbox persistence keys). */
+function isKnownAssetName(name: string): boolean {
+  return /\.(pcd|ply|splat|ksplat|spz)$/i.test(name);
+}
+
+/** Only serve raw point-cloud files through /api/pcd. */
+function isCloudFileName(name: string): boolean {
+  return /\.(pcd|ply)$/i.test(name);
+}
+
+/** Validate the POSTed boxes array (the shape toBBoxOutput produces). */
+function isValidBoxes(boxes: unknown): boxes is Array<Record<string, number | string>> {
+  if (!Array.isArray(boxes) || boxes.length > 10000) return false;
+  return boxes.every(
+    (b) =>
+      b !== null &&
+      typeof b === "object" &&
+      ["center_x", "center_y", "center_z", "size_x", "size_y", "size_z"].every(
+        (k) => typeof (b as any)[k] === "number" && Number.isFinite((b as any)[k]),
+      ),
+  );
+}
+
 // ---- Vite plugin ----
 
 export function apiPlugin(): Plugin {
@@ -57,7 +92,11 @@ export function apiPlugin(): Plugin {
     configureServer(server: ViteDevServer) {
       server.middlewares.use(
         "/api/pointcloud-files",
-        async (_req: IncomingMessage, res: ServerResponse) => {
+        async (req: IncomingMessage, res: ServerResponse) => {
+          if (req.method !== "GET") {
+            sendJson(res, 405, { success: false, error: "Method not allowed" });
+            return;
+          }
           try {
             const dir = join(PROJECT_ROOT, "pcd");
             const files = readdirSync(dir)
@@ -83,7 +122,7 @@ export function apiPlugin(): Plugin {
               `http://${req.headers.host || "localhost"}`,
             );
             const name = url.searchParams.get("name");
-            if (!isValidFileName(name)) {
+            if (!isValidFileName(name) || !isCloudFileName(name)) {
               sendJson(res, 400, { success: false, error: "Invalid name" });
               return;
             }
@@ -121,7 +160,7 @@ export function apiPlugin(): Plugin {
                 `http://${req.headers.host || "localhost"}`,
               );
               const name = url.searchParams.get("name");
-              if (!isValidFileName(name)) {
+              if (!isValidFileName(name) || !isKnownAssetName(name)) {
                 sendJson(res, 400, { success: false, error: "Invalid name" });
                 return;
               }
@@ -146,12 +185,16 @@ export function apiPlugin(): Plugin {
             const body = await readBody(req);
             const payload = JSON.parse(body);
             const name = payload.name;
-            if (!isValidFileName(name)) {
+            if (!isValidFileName(name) || !isKnownAssetName(name)) {
               sendJson(res, 400, { success: false, error: "Invalid name" });
               return;
             }
 
             const boxes = Array.isArray(payload.boxes) ? payload.boxes : [];
+            if (!isValidBoxes(boxes)) {
+              sendJson(res, 400, { success: false, error: "Invalid boxes payload" });
+              return;
+            }
 
             const perCloudPath = join(BBOX_DIR, `${name}.json`);
             writeJson(perCloudPath, { name, boxes });

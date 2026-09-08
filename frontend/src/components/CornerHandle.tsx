@@ -1,7 +1,7 @@
 import { useCallback } from "react";
 import * as THREE from "three";
 import type { DragEntry, Vec3 } from "../lib/bbox";
-import { cornerPairs, upsertDragEntry } from "../lib/bbox";
+import { upsertDragEntry } from "../lib/bbox";
 
 interface Props {
   boxId: string;
@@ -25,7 +25,7 @@ export function CornerHandle({ boxId, corner, position, radius, color, dragRefs 
       upsertDragEntry(
         dragRefs.current,
         key,
-        { boxId, kind: "corner", pairs: cornerPairs(corner) },
+        { boxId, corner },
         el,
       );
     },
