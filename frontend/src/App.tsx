@@ -3,19 +3,85 @@ import type { RefObject } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { PerspectiveCamera } from "@react-three/drei";
 import * as THREE from "three";
-import type { Vec3 } from "./lib/bbox";
-import { formatBboxJson, toBboxResult, vecMin, vecMax } from "./lib/bbox";
+import type { AxisSide, BBoxItem, DragEntry, DragKind, Vec3 } from "./lib/bbox";
+import {
+  applyDrag,
+  colorForIndex,
+  newBBoxId,
+  toBBoxOutput,
+  toBboxResult,
+  vecMin,
+  vecMax,
+} from "./lib/bbox";
 import { loadPcd, loadPly } from "./lib/pcd-loader";
 import { PointCloudView } from "./components/PointCloudView";
 import { BBoxLayer } from "./components/BBoxLayer";
-import { CornerHandle } from "./components/CornerHandle";
 import { BBoxPanel } from "./components/BBoxPanel";
 import { CameraControls } from "./components/CameraControls";
 
 // Cap the parsed cloud to keep rendering responsive (elec.pcd is ~6.5M points).
 const PCD_MAX_POINTS = 180_000;
-const HANDLE_COLOR = "#ff5252";
-const PICK_PIXEL_RADIUS = 16;
+
+/** Zero out delta components along axes not controlled by a drag entry. */
+function constrainDelta(delta: Vec3, pairs: AxisSide[]): Vec3 {
+  const active = [false, false, false];
+  for (const p of pairs) active[p.axis] = true;
+  return [
+    active[0] ? delta[0] : 0,
+    active[1] ? delta[1] : 0,
+    active[2] ? delta[2] : 0,
+  ];
+}
+
+/** Rebuild a labelled-box list from the backend payload (new or legacy shape). */
+function parseBoxes(data: any): BBoxItem[] {
+  if (Array.isArray(data.boxes)) {
+    const out: BBoxItem[] = [];
+    for (const b of data.boxes) {
+      if (Array.isArray(b?.min) && Array.isArray(b?.max) && b.min.length === 3 && b.max.length === 3) {
+        out.push({
+          id: typeof b.id === "string" ? b.id : newBBoxId(),
+          label: typeof b.label === "string" ? b.label : "object",
+          min: [b.min[0], b.min[1], b.min[2]] as Vec3,
+          max: [b.max[0], b.max[1], b.max[2]] as Vec3,
+        });
+      }
+    }
+    return out;
+  }
+
+  if (Array.isArray(data.min) && Array.isArray(data.max) && data.min.length === 3 && data.max.length === 3) {
+    return [
+      {
+        id: newBBoxId(),
+        label: "object",
+        min: [data.min[0], data.min[1], data.min[2]] as Vec3,
+        max: [data.max[0], data.max[1], data.max[2]] as Vec3,
+      },
+    ];
+  }
+
+  if (typeof data.center_x === "number" && typeof data.size_x === "number") {
+    return [
+      {
+        id: newBBoxId(),
+        label: "object",
+        min: [
+          data.center_x - data.size_x / 2,
+          data.center_y - data.size_y / 2,
+          data.center_z - data.size_z / 2,
+        ] as Vec3,
+        max: [
+          data.center_x + data.size_x / 2,
+          data.center_y + data.size_y / 2,
+          data.center_z + data.size_z / 2,
+        ] as Vec3,
+      },
+    ];
+  }
+
+  return [];
+}
 
 // ---- picker (raw canvas pointer events) ----
 
@@ -23,30 +89,36 @@ function Picker({
   sceneGroupRef,
   controlsRef,
   pointsRef,
-  handleRefs,
-  cornersRef,
+  dragRefs,
+  boxBodyRefs,
+  anchorZRef,
   onPlace,
   onDrag,
   onDragStart,
+  onSelectBox,
 }: {
   sceneGroupRef: RefObject<THREE.Group | null>;
   controlsRef: RefObject<any>;
   pointsRef: RefObject<THREE.Points | null>;
-  handleRefs: React.MutableRefObject<Array<THREE.Mesh | null>>;
-  cornersRef: React.MutableRefObject<{ min: Vec3 | null; max: Vec3 | null }>;
+  dragRefs: React.MutableRefObject<DragEntry[]>;
+  boxBodyRefs: React.MutableRefObject<{ boxId: string; mesh: THREE.Mesh }[]>;
+  anchorZRef: React.MutableRefObject<number>;
   onPlace: (p: Vec3) => void;
-  onDrag: (index: number, p: Vec3) => void;
-  onDragStart: () => void;
+  onDrag: (boxId: string, pairs: AxisSide[], delta: Vec3) => void;
+  onDragStart: (boxId: string) => void;
+  onSelectBox: (boxId: string) => void;
 }) {
   const { gl, camera } = useThree();
 
-  const latestRef = useRef({ onPlace, onDrag, onDragStart });
-  latestRef.current = { onPlace, onDrag, onDragStart };
+  const latestRef = useRef({ onPlace, onDrag, onDragStart, onSelectBox });
+  latestRef.current = { onPlace, onDrag, onDragStart, onSelectBox };
 
   const dragRef = useRef<{
     pointerId: number;
-    index: number;
+    boxId: string;
+    pairs: AxisSide[];
     plane: THREE.Plane;
+    startLocal: Vec3;
     moved: boolean;
   } | null>(null);
 
@@ -54,7 +126,7 @@ function Picker({
     const canvas = gl.domElement;
     const mouseDown = new THREE.Vector2();
     const mouseUp = new THREE.Vector2();
-    const downOnHandleRef = { current: false };
+    const downBoxIdRef = { current: null as string | null };
 
     const ndcOf = (clientX: number, clientY: number) => {
       const rect = canvas.getBoundingClientRect();
@@ -65,6 +137,13 @@ function Picker({
           -((clientY - rect.top) / rect.height) * 2 + 1,
         ),
       };
+    };
+
+    const raycasterFrom = (clientX: number, clientY: number) => {
+      const { ndc } = ndcOf(clientX, clientY);
+      const raycaster = new THREE.Raycaster();
+      raycaster.setFromCamera(ndc, camera);
+      return raycaster;
     };
 
     // Project the pointer ray onto the point-cloud local horizontal plane
@@ -83,14 +162,9 @@ function Picker({
       const worldStart = new THREE.Vector3(0, 0, anchorZLocal).applyMatrix4(
         sceneGroup.matrixWorld,
       );
-      const plane = new THREE.Plane(
-        new THREE.Vector3(0, 1, 0),
-        -worldStart.y,
-      );
+      const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -worldStart.y);
 
-      const { ndc } = ndcOf(clientX, clientY);
-      const raycaster = new THREE.Raycaster();
-      raycaster.setFromCamera(ndc, camera);
+      const raycaster = raycasterFrom(clientX, clientY);
       const worldHit = new THREE.Vector3();
       const hit = raycaster.ray.intersectPlane(plane, worldHit);
       if (!hit) return null;
@@ -99,10 +173,8 @@ function Picker({
       return [local.x, local.y, local.z];
     };
 
-    // Project the pointer ray onto an arbitrary world plane. This is used for
-    // corner dragging: the plane passes through the grabbed handle and faces
-    // the camera, so dragging moves the corner freely in 3D instead of only
-    // along the local horizontal XY plane.
+    // Project the pointer ray onto an arbitrary world plane (camera-facing),
+    // then convert the hit back into point-cloud local space.
     const localFromRayOnPlane = (
       clientX: number,
       clientY: number,
@@ -113,9 +185,7 @@ function Picker({
       sceneGroup.updateWorldMatrix(true, false);
       camera.updateMatrixWorld();
 
-      const { ndc } = ndcOf(clientX, clientY);
-      const raycaster = new THREE.Raycaster();
-      raycaster.setFromCamera(ndc, camera);
+      const raycaster = raycasterFrom(clientX, clientY);
       const worldHit = new THREE.Vector3();
       const hit = raycaster.ray.intersectPlane(plane, worldHit);
       if (!hit) return null;
@@ -127,10 +197,8 @@ function Picker({
     // Primary pick: raycast against the point cloud; fall back to the local
     // horizontal plane when the ray misses the cloud.
     const pickPoint = (clientX: number, clientY: number, anchorZLocal: number): Vec3 | null => {
-      const { ndc } = ndcOf(clientX, clientY);
-      const raycaster = new THREE.Raycaster();
+      const raycaster = raycasterFrom(clientX, clientY);
       raycaster.params.Points.threshold = 0.4;
-      raycaster.setFromCamera(ndc, camera);
 
       const pts = pointsRef.current;
       if (pts) {
@@ -149,66 +217,86 @@ function Picker({
       return localFromRayAtZ(clientX, clientY, anchorZLocal);
     };
 
-    // Grab a corner handle by projecting each handle to screen space and
-    // choosing the closest one within a pixel radius (more forgiving than a
-    // raw mesh raycast for small spheres in a large scene).
-    const handleAt = (clientX: number, clientY: number): number | null => {
-      const sceneGroup = sceneGroupRef.current;
-      if (!sceneGroup) return null;
-      sceneGroup.updateWorldMatrix(true, false);
-      camera.updateMatrixWorld();
+    // Pick a draggable element. Corners and the center handle win over edges
+    // and faces so the small spheres stay grabbable through the invisible
+    // face/edge planes; faces are the broadest fallback.
+    const dragAt = (raycaster: THREE.Raycaster): DragEntry | null => {
+      const entries = dragRefs.current;
+      if (entries.length === 0) return null;
+      const byMesh = new Map<THREE.Object3D, DragEntry>();
+      for (const e of entries) byMesh.set(e.mesh, e);
 
-      const rect = canvas.getBoundingClientRect();
-      const px = clientX - rect.left;
-      const py = clientY - rect.top;
-
-      let bestIdx: number | null = null;
-      let bestDist = Infinity;
-      for (let i = 0; i < handleRefs.current.length; i++) {
-        const mesh = handleRefs.current[i];
-        if (!mesh) continue;
-        const world = mesh.getWorldPosition(new THREE.Vector3());
-        const ndc = world.project(camera);
-        const sx = (ndc.x * 0.5 + 0.5) * rect.width;
-        const sy = (-ndc.y * 0.5 + 0.5) * rect.height;
-        const d = Math.hypot(sx - px, sy - py);
-        if (d < bestDist) {
-          bestDist = d;
-          bestIdx = i;
+      const pick = (kind: DragKind): DragEntry | null => {
+        const meshes = entries.filter((e) => e.kind === kind).map((e) => e.mesh);
+        if (meshes.length === 0) return null;
+        const hits = raycaster.intersectObjects(meshes, false);
+        for (const h of hits) {
+          const entry = byMesh.get(h.object);
+          if (entry) return entry;
         }
-      }
-      return bestIdx !== null && bestDist <= PICK_PIXEL_RADIUS ? bestIdx : null;
+        return null;
+      };
+
+      return pick("corner") ?? pick("center") ?? pick("edge") ?? pick("face");
+    };
+
+    // Fallback pick against the semi-transparent box bodies (used to select a
+    // box when the pointer lands on its fill rather than a handle/face).
+    const bodyAt = (raycaster: THREE.Raycaster): string | null => {
+      const bodies = boxBodyRefs.current;
+      if (bodies.length === 0) return null;
+      const hits = raycaster.intersectObjects(
+        bodies.map((b) => b.mesh),
+        false,
+      );
+      if (hits.length === 0) return null;
+      const found = bodies.find((b) => b.mesh === hits[0]!.object);
+      return found ? found.boxId : null;
     };
 
     const onPointerDown = (e: PointerEvent) => {
       mouseDown.set(e.clientX, e.clientY);
-      const idx = handleAt(e.clientX, e.clientY);
-      if (idx === null) {
-        downOnHandleRef.current = false;
+      downBoxIdRef.current = null;
+
+      const sceneGroup = sceneGroupRef.current;
+      const raycaster = raycasterFrom(e.clientX, e.clientY);
+      const entry = dragAt(raycaster);
+
+      if (!entry) {
+        downBoxIdRef.current = bodyAt(raycaster);
         return;
       }
-      downOnHandleRef.current = true;
 
-      const mesh = handleRefs.current[idx];
-      const sceneGroup = sceneGroupRef.current;
+      // Dragging moves within a camera-facing plane through the grabbed
+      // element, so corner/center translate freely in 3D while edges/faces
+      // are later constrained to their controlled axes by `constrainDelta`.
       let plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-      if (mesh && sceneGroup) {
+      let startLocal: Vec3 = [0, 0, 0];
+      if (sceneGroup) {
         sceneGroup.updateWorldMatrix(true, false);
         camera.updateMatrixWorld();
-        const worldPos = mesh.getWorldPosition(new THREE.Vector3());
+        const worldPos = entry.mesh.getWorldPosition(new THREE.Vector3());
         const camDir = new THREE.Vector3();
         camera.getWorldDirection(camDir);
         plane = new THREE.Plane(camDir.clone(), -camDir.dot(worldPos));
+        const worldHit = new THREE.Vector3();
+        if (raycaster.ray.intersectPlane(plane, worldHit)) {
+          const local = sceneGroup.worldToLocal(worldHit.clone());
+          startLocal = [local.x, local.y, local.z];
+        }
       }
 
       dragRef.current = {
         pointerId: e.pointerId,
-        index: idx,
+        boxId: entry.boxId,
+        pairs: entry.pairs,
         plane,
+        startLocal,
         moved: false,
       };
+      downBoxIdRef.current = entry.boxId;
 
-      latestRef.current.onDragStart();
+      latestRef.current.onDragStart(entry.boxId);
 
       if (controlsRef.current) controlsRef.current.enabled = false;
       try {
@@ -222,7 +310,12 @@ function Picker({
       const local = localFromRayOnPlane(e.clientX, e.clientY, drag.plane);
       if (local) {
         drag.moved = true;
-        latestRef.current.onDrag(drag.index, local);
+        const delta: Vec3 = [
+          local[0] - drag.startLocal[0],
+          local[1] - drag.startLocal[1],
+          local[2] - drag.startLocal[2],
+        ];
+        latestRef.current.onDrag(drag.boxId, drag.pairs, constrainDelta(delta, drag.pairs));
       }
     };
 
@@ -241,12 +334,15 @@ function Picker({
     const onClick = (e: MouseEvent) => {
       mouseUp.set(e.clientX, e.clientY);
       if (mouseDown.distanceTo(mouseUp) > 3) return; // drag, not click
-      if (downOnHandleRef.current) return; // clicking an existing handle
+      if (downBoxIdRef.current) {
+        latestRef.current.onSelectBox(downBoxIdRef.current);
+        return;
+      }
 
       const el = e.target as HTMLElement;
       if (el.closest("[data-overlay]")) return;
 
-      const anchorZ = cornersRef.current.min ? cornersRef.current.min[2] : 0;
+      const anchorZ = anchorZRef.current;
       const p = pickPoint(e.clientX, e.clientY, anchorZ);
       if (p) latestRef.current.onPlace(p);
     };
@@ -266,7 +362,7 @@ function Picker({
       if (dragRef.current && controlsRef.current) controlsRef.current.enabled = true;
       dragRef.current = null;
     };
-  }, [gl, camera, sceneGroupRef, controlsRef, pointsRef, handleRefs, cornersRef]);
+  }, [gl, camera, sceneGroupRef, controlsRef, pointsRef, dragRefs, boxBodyRefs, anchorZRef]);
 
   return null;
 }
@@ -279,29 +375,38 @@ function Scene({
   handleRadius,
   lineWidth,
   opacity,
-  cornerMin,
-  cornerMax,
-  cornersRef,
+  boxes,
+  activeId,
+  placing,
+  draftMin,
+  anchorZRef,
   onPlace,
   onDrag,
   onDragStart,
+  onSelectBox,
 }: {
   positions: Float32Array | null;
   pointSize: number;
   handleRadius: number;
   lineWidth: number;
   opacity: number;
-  cornerMin: Vec3 | null;
-  cornerMax: Vec3 | null;
-  cornersRef: React.MutableRefObject<{ min: Vec3 | null; max: Vec3 | null }>;
+  boxes: BBoxItem[];
+  activeId: string | null;
+  placing: boolean;
+  draftMin: Vec3 | null;
+  anchorZRef: React.MutableRefObject<number>;
   onPlace: (p: Vec3) => void;
-  onDrag: (index: number, p: Vec3) => void;
-  onDragStart: () => void;
+  onDrag: (boxId: string, pairs: AxisSide[], delta: Vec3) => void;
+  onDragStart: (boxId: string) => void;
+  onSelectBox: (boxId: string) => void;
 }) {
   const sceneGroupRef = useRef<THREE.Group>(null);
   const controlsRef = useRef<any>(null);
   const pointsRef = useRef<THREE.Points>(null);
-  const handleRefs = useRef<Array<THREE.Mesh | null>>([]);
+  const dragRefs = useRef<DragEntry[]>([]);
+  const boxBodyRefs = useRef<{ boxId: string; mesh: THREE.Mesh }[]>([]);
+
+  const draftColor = colorForIndex(boxes.length);
 
   return (
     <Canvas style={{ width: "100%", height: "100%" }}>
@@ -312,26 +417,27 @@ function Scene({
       <group ref={sceneGroupRef} rotation={[-Math.PI / 2, 0, 0]}>
         <PointCloudView ref={pointsRef} positions={positions} pointSize={pointSize} />
 
-        {cornerMin && !cornerMax && (
-          <CornerHandle
-            position={cornerMin}
-            radius={handleRadius}
-            color={HANDLE_COLOR}
-            index={0}
-            handleRefs={handleRefs}
-          />
-        )}
-
-        {cornerMin && cornerMax && (
+        {boxes.map((box, i) => (
           <BBoxLayer
-            cornerMin={cornerMin}
-            cornerMax={cornerMax}
+            key={box.id}
+            boxId={box.id}
+            min={box.min}
+            max={box.max}
             handleRadius={handleRadius}
             lineWidth={lineWidth}
             opacity={opacity}
-            color={HANDLE_COLOR}
-            handleRefs={handleRefs}
+            color={colorForIndex(i)}
+            active={box.id === activeId}
+            dragRefs={dragRefs}
+            boxBodyRefs={boxBodyRefs}
           />
+        ))}
+
+        {placing && draftMin && (
+          <mesh position={draftMin}>
+            <sphereGeometry args={[handleRadius, 20, 20]} />
+            <meshBasicMaterial color={draftColor} />
+          </mesh>
         )}
       </group>
 
@@ -341,11 +447,13 @@ function Scene({
         sceneGroupRef={sceneGroupRef}
         controlsRef={controlsRef}
         pointsRef={pointsRef}
-        handleRefs={handleRefs}
-        cornersRef={cornersRef}
+        dragRefs={dragRefs}
+        boxBodyRefs={boxBodyRefs}
+        anchorZRef={anchorZRef}
         onPlace={onPlace}
         onDrag={onDrag}
         onDragStart={onDragStart}
+        onSelectBox={onSelectBox}
       />
     </Canvas>
   );
@@ -387,31 +495,47 @@ export function App() {
   const [cloudFiles, setCloudFiles] = useState<string[]>([]);
   const [selectedCloud, setSelectedCloud] = useLocalStorageState<string>("selectedCloud", "elec.pcd");
 
-  const [cornerMin, setCornerMin] = useState<Vec3 | null>(null);
-  const [cornerMax, setCornerMax] = useState<Vec3 | null>(null);
-  const historyRef = useRef<Array<{ min: Vec3 | null; max: Vec3 | null }>>([]);
+  const [boxes, setBoxes] = useState<BBoxItem[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [placing, setPlacing] = useState(false);
+  const [draftMin, setDraftMin] = useState<Vec3 | null>(null);
+
+  const historyRef = useRef<BBoxItem[][]>([]);
+  const dirtyRef = useRef(false);
 
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [copied, setCopied] = useState(false);
 
-  const cornersRef = useRef<{ min: Vec3 | null; max: Vec3 | null }>({
-    min: cornerMin,
-    max: cornerMax,
-  });
-  cornersRef.current = { min: cornerMin, max: cornerMax };
+  // Refs mirroring the latest state so event callbacks never see stale values.
+  const boxesRef = useRef(boxes);
+  boxesRef.current = boxes;
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
+  const placingRef = useRef(placing);
+  placingRef.current = placing;
+  const draftMinRef = useRef(draftMin);
+  draftMinRef.current = draftMin;
+
+  const anchorZRef = useRef(0);
+  anchorZRef.current = draftMin ? draftMin[2] : 0;
 
   const pushHistory = useCallback(() => {
-    const cur = cornersRef.current;
-    historyRef.current = [...historyRef.current, { min: cur.min, max: cur.max }];
+    const snap = boxesRef.current.map((b) => ({
+      ...b,
+      min: [...b.min] as Vec3,
+      max: [...b.max] as Vec3,
+    }));
+    historyRef.current = [...historyRef.current, snap];
   }, []);
 
   const undo = useCallback(() => {
     const h = historyRef.current;
     if (h.length === 0) return;
     const last = h[h.length - 1]!;
-    setCornerMin(last.min);
-    setCornerMax(last.max);
+    setBoxes(last);
     historyRef.current = h.slice(0, -1);
+    setActiveId((id) => (id && last.some((b) => b.id === id) ? id : (last[0]?.id ?? null)));
+    dirtyRef.current = true;
   }, []);
 
   useEffect(() => {
@@ -473,14 +597,40 @@ export function App() {
     };
   }, [selectedCloud]);
 
-  const json = useMemo(
-    () => (cornerMin && cornerMax ? formatBboxJson(cornerMin, cornerMax) : null),
-    [cornerMin, cornerMax],
+  // Auto-load saved boxes for the currently selected cloud (if one exists).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch(`/api/bbox?name=${encodeURIComponent(selectedCloud)}`);
+        if (resp.status === 404) return;
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        if (cancelled) return;
+        const loaded = parseBoxes(data);
+        setBoxes(loaded);
+        setActiveId(loaded[0]?.id ?? null);
+        setPlacing(false);
+        setDraftMin(null);
+        historyRef.current = [];
+        dirtyRef.current = false;
+      } catch {
+        // No saved boxes (or load failed): start empty.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedCloud]);
+
+  const activeBox = useMemo(
+    () => boxes.find((b) => b.id === activeId) ?? null,
+    [boxes, activeId],
   );
 
   const result = useMemo(
-    () => (cornerMin && cornerMax ? toBboxResult(cornerMin, cornerMax) : null),
-    [cornerMin, cornerMax],
+    () => (activeBox ? toBboxResult(activeBox.min, activeBox.max) : null),
+    [activeBox],
   );
 
   const center = useMemo<Vec3 | null>(
@@ -493,73 +643,114 @@ export function App() {
     [result],
   );
 
+  const json = useMemo(
+    () => (boxes.length > 0 ? JSON.stringify({ boxes: boxes.map(toBBoxOutput) }) : null),
+    [boxes],
+  );
+
   // Console output matching the old script's ~1/3 Hz throttle.
   useEffect(() => {
-    if (!cornerMin || !cornerMax) return;
-    console.log(formatBboxJson(cornerMin, cornerMax));
+    if (boxes.length === 0) return;
+    console.log(json);
     const id = window.setInterval(() => {
-      console.log(formatBboxJson(cornerMin, cornerMax));
+      console.log(json);
     }, 3000);
     return () => window.clearInterval(id);
-  }, [cornerMin, cornerMax]);
+  }, [json, boxes.length]);
 
-  const handlePlace = useCallback((p: Vec3) => {
-    const cur = cornersRef.current;
-    if (!cur.min) {
-      pushHistory();
-      setCornerMin(p);
-    } else if (!cur.max) {
-      // The two clicks are diagonal corners in either order, so normalise
-      // them into a true component-wise min/max pair.
-      pushHistory();
-      const a = cur.min;
-      setCornerMin(vecMin(a, p));
-      setCornerMax(vecMax(a, p));
-    }
-  }, [pushHistory]);
+  const handlePlace = useCallback(
+    (p: Vec3) => {
+      if (!placingRef.current) return;
+      const draft = draftMinRef.current;
+      if (!draft) {
+        setDraftMin(p);
+      } else {
+        pushHistory();
+        dirtyRef.current = true;
+        const id = newBBoxId();
+        const label = `object_${boxesRef.current.length + 1}`;
+        const box: BBoxItem = { id, label, min: vecMin(draft, p), max: vecMax(draft, p) };
+        setBoxes((prev) => [...prev, box]);
+        setActiveId(id);
+        setDraftMin(null);
+        setPlacing(false);
+      }
+    },
+    [pushHistory],
+  );
 
-  const handleDrag = useCallback((index: number, p: Vec3) => {
-    const cur = cornersRef.current;
-    if (!cur.min && !cur.max) return;
-
-    const min: Vec3 = cur.min ? [...cur.min] : p;
-    const max: Vec3 = cur.max ? [...cur.max] : p;
-
-    // index bit0 selects min/max x, bit1 selects min/max y. Clamp against the
-    // opposite boundary so a handle can never be dragged past its counterpart
-    // and produce a negative-size box.
-    if ((index & 1) === 0) {
-      min[0] = cur.max ? Math.min(p[0], max[0]) : p[0];
-    } else {
-      max[0] = cur.min ? Math.max(p[0], min[0]) : p[0];
-    }
-    if (((index >> 1) & 1) === 0) {
-      min[1] = cur.max ? Math.min(p[1], max[1]) : p[1];
-    } else {
-      max[1] = cur.min ? Math.max(p[1], min[1]) : p[1];
-    }
-    if (((index >> 2) & 1) === 0) {
-      min[2] = cur.max ? Math.min(p[2], max[2]) : p[2];
-    } else {
-      max[2] = cur.min ? Math.max(p[2], min[2]) : p[2];
-    }
-
-    if (cur.min) setCornerMin(min);
-    if (cur.max) setCornerMax(max);
+  const handleDrag = useCallback((boxId: string, pairs: AxisSide[], delta: Vec3) => {
+    setBoxes((prev) =>
+      prev.map((b) => (b.id === boxId ? applyDrag(b, pairs, delta) : b)),
+    );
   }, []);
 
+  const handleDragStart = useCallback(
+    (boxId: string) => {
+      pushHistory();
+      dirtyRef.current = true;
+      setActiveId(boxId);
+    },
+    [pushHistory],
+  );
+
+  const handleSelectBox = useCallback((id: string) => setActiveId(id), []);
+
+  const handleNewBox = useCallback(() => {
+    setPlacing(true);
+    setDraftMin(null);
+  }, []);
+
+  const handleRename = useCallback((id: string, label: string) => {
+    dirtyRef.current = true;
+    setBoxes((prev) => prev.map((b) => (b.id === id ? { ...b, label } : b)));
+  }, []);
+
+  const handleDelete = useCallback(
+    (id: string) => {
+      pushHistory();
+      dirtyRef.current = true;
+      setBoxes((prev) => prev.filter((b) => b.id !== id));
+      setActiveId((cur) => (cur === id ? null : cur));
+    },
+    [pushHistory],
+  );
+
   const handleReset = useCallback(() => {
-    const cur = cornersRef.current;
-    if (!cur.min && !cur.max) return;
+    if (boxesRef.current.length === 0 && !draftMinRef.current) return;
     pushHistory();
-    setCornerMin(null);
-    setCornerMax(null);
+    dirtyRef.current = true;
+    setBoxes([]);
+    setActiveId(null);
+    setPlacing(false);
+    setDraftMin(null);
   }, [pushHistory]);
+
+  const handleBeginEdit = useCallback(() => {
+    pushHistory();
+    dirtyRef.current = true;
+  }, [pushHistory]);
+
+  const handleSetMin = useCallback((v: Vec3) => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    setBoxes((prev) => prev.map((b) => (b.id === id ? { ...b, min: [...v] as Vec3 } : b)));
+  }, []);
+
+  const handleSetMax = useCallback((v: Vec3) => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    setBoxes((prev) => prev.map((b) => (b.id === id ? { ...b, max: [...v] as Vec3 } : b)));
+  }, []);
 
   const handleSelectCloud = useCallback((name: string) => {
     setSelectedCloud(name);
-    setCornerMin(null);
-    setCornerMax(null);
+    setBoxes([]);
+    setActiveId(null);
+    setPlacing(false);
+    setDraftMin(null);
+    historyRef.current = [];
+    dirtyRef.current = false;
   }, []);
 
   const handleCopy = useCallback(async () => {
@@ -573,29 +764,45 @@ export function App() {
     }
   }, [json]);
 
+  const persistBoxes = useCallback(async (name: string, list: BBoxItem[]) => {
+    const resp = await fetch("/api/bbox", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, boxes: list.map(toBBoxOutput) }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  }, []);
+
   const handleSave = useCallback(async () => {
-    if (!cornerMin || !cornerMax) return;
+    if (boxesRef.current.length === 0) return;
     setSaveState("saving");
     try {
-      const resp = await fetch("/api/bbox", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(toBboxResult(cornerMin, cornerMax)),
-      });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      await persistBoxes(selectedCloud, boxesRef.current);
       setSaveState("saved");
       window.setTimeout(() => setSaveState("idle"), 2000);
     } catch {
       setSaveState("error");
       window.setTimeout(() => setSaveState("idle"), 2000);
     }
-  }, [cornerMin, cornerMax]);
+  }, [selectedCloud, persistBoxes]);
+
+  // Debounced auto-save: persist after the user finishes editing.
+  useEffect(() => {
+    if (!dirtyRef.current) return;
+    const id = window.setTimeout(() => {
+      void persistBoxes(selectedCloud, boxesRef.current).catch(() => {});
+    }, 600);
+    return () => window.clearTimeout(id);
+  }, [boxes, selectedCloud, persistBoxes]);
 
   return (
     <div style={{ width: "100%", height: "100%", position: "relative" }}>
       <BBoxPanel
-        cornerMin={cornerMin}
-        cornerMax={cornerMax}
+        boxes={boxes}
+        activeId={activeId}
+        placing={placing}
+        cornerMin={activeBox?.min ?? null}
+        cornerMax={activeBox?.max ?? null}
         center={center}
         size={size}
         pointSize={pointSize}
@@ -607,9 +814,9 @@ export function App() {
         cloudFiles={cloudFiles}
         selectedCloud={selectedCloud}
         onSelectCloud={handleSelectCloud}
-        onSetMin={setCornerMin}
-        onSetMax={setCornerMax}
-        onBeginEdit={pushHistory}
+        onSetMin={handleSetMin}
+        onSetMax={handleSetMax}
+        onBeginEdit={handleBeginEdit}
         onReset={handleReset}
         onSave={handleSave}
         onCopy={handleCopy}
@@ -617,6 +824,10 @@ export function App() {
         onHandleRadius={setHandleRadius}
         onLineWidth={setLineWidth}
         onOpacity={setOpacity}
+        onNewBox={handleNewBox}
+        onSelectBox={handleSelectBox}
+        onRename={handleRename}
+        onDeleteBox={handleDelete}
       />
 
       {loading && (
@@ -661,12 +872,15 @@ export function App() {
         handleRadius={handleRadius}
         lineWidth={lineWidth}
         opacity={opacity}
-        cornerMin={cornerMin}
-        cornerMax={cornerMax}
-        cornersRef={cornersRef}
+        boxes={boxes}
+        activeId={activeId}
+        placing={placing}
+        draftMin={draftMin}
+        anchorZRef={anchorZRef}
         onPlace={handlePlace}
         onDrag={handleDrag}
-        onDragStart={pushHistory}
+        onDragStart={handleDragStart}
+        onSelectBox={handleSelectBox}
       />
     </div>
   );

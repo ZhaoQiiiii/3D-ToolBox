@@ -1,27 +1,39 @@
+import { useCallback } from "react";
 import * as THREE from "three";
-import type { Vec3 } from "../lib/bbox";
+import type { DragEntry, Vec3 } from "../lib/bbox";
+import { cornerPairs, upsertDragEntry } from "../lib/bbox";
 
 interface Props {
+  boxId: string;
+  corner: number;
   position: Vec3;
   radius: number;
   color: string;
-  index: number;
-  handleRefs: React.MutableRefObject<Array<THREE.Mesh | null>>;
+  dragRefs: React.MutableRefObject<DragEntry[]>;
 }
 
 /**
- * A single draggable corner sphere. The mesh is registered into
- * `handleRefs.current[index]` so the parent Picker can raycast against it and
- * map a drag back to the matching corner component of corner_min/corner_max.
+ * A single draggable corner sphere, registered into the shared `dragRefs`
+ * registry with its box id and corner face-pairs so the Picker can map a drag
+ * back to the correct box + corner.
  */
-export function CornerHandle({ position, radius, color, index, handleRefs }: Props) {
+export function CornerHandle({ boxId, corner, position, radius, color, dragRefs }: Props) {
+  const key = `${boxId}:corner:${corner}`;
+
+  const setRef = useCallback(
+    (el: THREE.Mesh | null) => {
+      upsertDragEntry(
+        dragRefs.current,
+        key,
+        { boxId, kind: "corner", pairs: cornerPairs(corner) },
+        el,
+      );
+    },
+    [boxId, corner, dragRefs, key],
+  );
+
   return (
-    <mesh
-      ref={(el) => {
-        handleRefs.current[index] = el;
-      }}
-      position={position}
-    >
+    <mesh ref={setRef} position={position}>
       <sphereGeometry args={[radius, 20, 20]} />
       <meshBasicMaterial color={color} />
     </mesh>

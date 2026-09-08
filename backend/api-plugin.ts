@@ -3,7 +3,8 @@
  *
  * - GET  /api/pointcloud-files     → list .pcd / .ply files under pcd/
  * - GET  /api/pcd?name=elec.pcd    → serve a binary point cloud (PCD or PLY)
- * - POST /api/bbox                 → persist the picked AABB to bbox_result.json
+ * - GET  /api/bbox?name=elec.pcd   → load saved labelled boxes for a cloud
+ * - POST /api/bbox                 → persist labelled boxes (per-cloud + legacy)
  */
 import type { Plugin, ViteDevServer } from "vite";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -49,6 +50,7 @@ function isValidFileName(name: unknown): name is string {
 
 export function apiPlugin(): Plugin {
   const PROJECT_ROOT = join(import.meta.dirname, "..");
+  const BBOX_DIR = join(PROJECT_ROOT, "bboxes");
 
   return {
     name: "3d-bbox-tool-api",
@@ -104,22 +106,77 @@ export function apiPlugin(): Plugin {
           if (req.method === "OPTIONS") {
             res.writeHead(204, {
               "Access-Control-Allow-Origin": "*",
-              "Access-Control-Allow-Methods": "POST, OPTIONS",
+              "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
               "Access-Control-Allow-Headers": "Content-Type",
             });
             res.end();
             return;
           }
+
+          // GET → load the saved bbox for a specific cloud file.
+          if (req.method === "GET") {
+            try {
+              const url = new URL(
+                req.url || "",
+                `http://${req.headers.host || "localhost"}`,
+              );
+              const name = url.searchParams.get("name");
+              if (!isValidFileName(name)) {
+                sendJson(res, 400, { success: false, error: "Invalid name" });
+                return;
+              }
+              const filePath = join(BBOX_DIR, `${name}.json`);
+              const data = JSON.parse(readFileSync(filePath, "utf-8"));
+              sendJson(res, 200, data);
+            } catch {
+              sendJson(res, 404, { success: false, error: "Not found" });
+            }
+            return;
+          }
+
           if (req.method !== "POST") {
             sendJson(res, 405, { success: false, error: "Method not allowed" });
             return;
           }
+
+          // POST → persist the labelled boxes as a per-cloud copy (for
+          // auto-reload) plus the legacy six-field bbox_result.json (from the
+          // first box) so downstream stays compatible.
           try {
             const body = await readBody(req);
             const payload = JSON.parse(body);
-            const outPath = join(PROJECT_ROOT, "bbox_result.json");
-            writeJson(outPath, payload);
-            sendJson(res, 200, { success: true, path: outPath });
+            const name = payload.name;
+            if (!isValidFileName(name)) {
+              sendJson(res, 400, { success: false, error: "Invalid name" });
+              return;
+            }
+
+            const boxes = Array.isArray(payload.boxes) ? payload.boxes : [];
+
+            const perCloudPath = join(BBOX_DIR, `${name}.json`);
+            writeJson(perCloudPath, { name, boxes });
+
+            const first = boxes[0];
+            const legacy = first
+              ? {
+                  center_x: first.center_x,
+                  center_y: first.center_y,
+                  center_z: first.center_z,
+                  size_x: first.size_x,
+                  size_y: first.size_y,
+                  size_z: first.size_z,
+                }
+              : {
+                  center_x: 0,
+                  center_y: 0,
+                  center_z: 0,
+                  size_x: 0,
+                  size_y: 0,
+                  size_z: 0,
+                };
+            writeJson(join(PROJECT_ROOT, "bbox_result.json"), legacy);
+
+            sendJson(res, 200, { success: true, path: perCloudPath, count: boxes.length });
           } catch (err: any) {
             sendJson(res, 500, { success: false, error: err.message });
           }

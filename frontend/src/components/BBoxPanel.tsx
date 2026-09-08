@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import type { Vec3 } from "../lib/bbox";
+import type { BBoxItem, Vec3 } from "../lib/bbox";
+import { colorForIndex } from "../lib/bbox";
 
 const SLIDER_RANGES: Record<"x" | "y" | "z", [number, number]> = {
   x: [-30.0, 50.0],
@@ -19,6 +20,12 @@ const rangeStyle: React.CSSProperties = {
   height: 4,
 };
 
+const rangeStyleCompact: React.CSSProperties = {
+  width: 64,
+  accentColor: "#3498db",
+  height: 4,
+};
+
 const labelStyle: React.CSSProperties = {
   width: 64,
   color: "#888",
@@ -26,6 +33,9 @@ const labelStyle: React.CSSProperties = {
 };
 
 interface Props {
+  boxes: BBoxItem[];
+  activeId: string | null;
+  placing: boolean;
   cornerMin: Vec3 | null;
   cornerMax: Vec3 | null;
   center: Vec3 | null;
@@ -49,6 +59,10 @@ interface Props {
   onHandleRadius: (v: number) => void;
   onLineWidth: (v: number) => void;
   onOpacity: (v: number) => void;
+  onNewBox: () => void;
+  onSelectBox: (id: string) => void;
+  onRename: (id: string, label: string) => void;
+  onDeleteBox: (id: string) => void;
 }
 
 const PANEL_STYLE: React.CSSProperties = {
@@ -61,7 +75,7 @@ const PANEL_STYLE: React.CSSProperties = {
   fontFamily: "monospace",
   borderRadius: 8,
   padding: "14px 16px",
-  width: 440,
+  width: 540,
   maxHeight: "calc(100vh - 32px)",
   overflowY: "auto",
   fontSize: 14,
@@ -72,11 +86,13 @@ function VecEditor({
   value,
   onChange,
   onBeginEdit,
+  compact = false,
 }: {
   label: string;
   value: Vec3;
   onChange: (v: Vec3) => void;
   onBeginEdit: () => void;
+  compact?: boolean;
 }) {
   const setAxis = (axis: "x" | "y" | "z", n: number) => {
     const next: Vec3 = [...value];
@@ -120,7 +136,7 @@ function VecEditor({
               value={value[idx]!}
               onChange={(e) => setAxis(key, Number(e.target.value))}
               onPointerDown={onBeginEdit}
-              style={rangeStyle}
+              style={compact ? rangeStyleCompact : rangeStyle}
             />
           </div>
         );
@@ -263,6 +279,9 @@ function SizeControl({
 }
 
 export function BBoxPanel({
+  boxes,
+  activeId,
+  placing,
   cornerMin,
   cornerMax,
   center,
@@ -286,6 +305,10 @@ export function BBoxPanel({
   onHandleRadius,
   onLineWidth,
   onOpacity,
+  onNewBox,
+  onSelectBox,
+  onRename,
+  onDeleteBox,
 }: Props) {
   const cloudOptions = cloudFiles.includes(selectedCloud)
     ? cloudFiles
@@ -357,21 +380,103 @@ export function BBoxPanel({
       </div>
 
       <div style={{ marginTop: 12, borderTop: "1px solid #333", paddingTop: 8 }}>
-        {cornerMin && (
-          <VecEditor
-            label="corner_min"
-            value={cornerMin}
-            onChange={onSetMin}
-            onBeginEdit={onBeginEdit}
-          />
-        )}
-        {cornerMax && (
-          <VecEditor
-            label="corner_max"
-            value={cornerMax}
-            onChange={onSetMax}
-            onBeginEdit={onBeginEdit}
-          />
+        <div style={{ color: "#fff", fontWeight: 700, fontSize: 14, marginBottom: 6 }}>
+          物体（{boxes.length}）
+        </div>
+
+        {boxes.map((box, i) => {
+          const active = box.id === activeId;
+          return (
+            <div
+              key={box.id}
+              onClick={() => onSelectBox(box.id)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                marginTop: 4,
+                padding: "4px 6px",
+                background: active ? "#1a1a2e" : "transparent",
+                border: active ? "1px solid #3498db" : "1px solid #333",
+                borderRadius: 4,
+                cursor: "pointer",
+              }}
+            >
+              <span
+                style={{
+                  width: 12,
+                  height: 12,
+                  borderRadius: "50%",
+                  background: colorForIndex(i),
+                  flexShrink: 0,
+                }}
+              />
+              <input
+                type="text"
+                value={box.label}
+                onChange={(e) => onRename(box.id, e.target.value)}
+                onFocus={() => onSelectBox(box.id)}
+                onClick={(e) => e.stopPropagation()}
+                placeholder="label"
+                style={labelInputStyle}
+              />
+              <button
+                type="button"
+                aria-label="delete"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDeleteBox(box.id);
+                }}
+                style={delBtnStyle}
+              >
+                ×
+              </button>
+            </div>
+          );
+        })}
+
+        <button
+          type="button"
+          onClick={onNewBox}
+          style={{
+            width: "100%",
+            marginTop: 8,
+            background: placing ? "#1a3a5c" : "#1a1a2e",
+            color: placing ? "#7ec8ff" : "#3498db",
+            border: "1px solid #3498db",
+            borderRadius: 4,
+            padding: "6px 0",
+            cursor: "pointer",
+            fontFamily: "monospace",
+            fontSize: 13,
+          }}
+        >
+          {placing ? "放置中… 在场景中点击两次" : "+ 新建物体"}
+        </button>
+      </div>
+
+      <div style={{ marginTop: 12, borderTop: "1px solid #333", paddingTop: 8 }}>
+        {cornerMin && cornerMax && (
+          <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <VecEditor
+                label="corner_min"
+                value={cornerMin}
+                onChange={onSetMin}
+                onBeginEdit={onBeginEdit}
+                compact
+              />
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <VecEditor
+                label="corner_max"
+                value={cornerMax}
+                onChange={onSetMax}
+                onBeginEdit={onBeginEdit}
+                compact
+              />
+            </div>
+          </div>
         )}
 
         <div style={{ color: "#fff", fontWeight: 600, marginBottom: 4, marginTop: 8 }}>输出（m）</div>
@@ -440,4 +545,33 @@ const stepperBtnStyle: React.CSSProperties = {
   fontSize: 12,
   lineHeight: 1,
   padding: 0,
+};
+
+const labelInputStyle: React.CSSProperties = {
+  flex: 1,
+  height: 26,
+  background: "#111",
+  color: "#eee",
+  border: "1px solid #333",
+  borderRadius: 4,
+  padding: "2px 6px",
+  fontFamily: "monospace",
+  fontSize: 13,
+};
+
+const delBtnStyle: React.CSSProperties = {
+  width: 24,
+  height: 24,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  background: "#1a1a2e",
+  color: "#ff6b6b",
+  border: "1px solid #555",
+  borderRadius: 4,
+  cursor: "pointer",
+  fontSize: 16,
+  lineHeight: 1,
+  padding: 0,
+  flexShrink: 0,
 };
