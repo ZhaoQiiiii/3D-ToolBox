@@ -42,6 +42,14 @@ export const BBOX_PALETTE = [
   "#607d8b",
 ] as const;
 
+// Shared box-visual constants, used by BOTH renderers of the same AABB look:
+// the R3F BBoxLayer (point-cloud mode) and the imperative overlay built inside
+// GaussianSplatViewer (3DGS mode). Keep them in sync here, not per file.
+export const INACTIVE_EDGE_COLOR = "#7a7a7a";
+export const INACTIVE_HANDLE_COLOR = "#9a9a9a";
+export const INACTIVE_FILL_FACTOR = 0.55;
+export const MIN_EDGE_RADIUS = 0.0005;
+
 export function colorForIndex(index: number): string {
   return BBOX_PALETTE[index % BBOX_PALETTE.length]!;
 }

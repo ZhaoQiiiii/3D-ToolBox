@@ -1,6 +1,15 @@
 import * as THREE from "three";
 import type { DragEntry, Vec3 } from "../lib/bbox";
-import { cornerPositions, boxEdges, centerOf, sizeOf } from "../lib/bbox";
+import {
+  INACTIVE_EDGE_COLOR,
+  INACTIVE_FILL_FACTOR,
+  INACTIVE_HANDLE_COLOR,
+  MIN_EDGE_RADIUS,
+  boxEdges,
+  centerOf,
+  cornerPositions,
+  sizeOf,
+} from "../lib/bbox";
 import { CornerHandle } from "./CornerHandle";
 
 interface Props {
@@ -61,13 +70,13 @@ export function BBoxLayer({
 }: Props) {
   const corners = cornerPositions(min, max);
   const edges = boxEdges();
-  const radius = Math.max(0.0005, lineWidth / 2);
+  const radius = Math.max(MIN_EDGE_RADIUS, lineWidth / 2);
   const center = centerOf(min, max);
   const size = sizeOf(min, max);
 
-  const edgeColor = active ? color : "#7a7a7a";
-  const handleColor = active ? color : "#9a9a9a";
-  const fillOpacity = active ? opacity : opacity * 0.55;
+  const edgeColor = active ? color : INACTIVE_EDGE_COLOR;
+  const handleColor = active ? color : INACTIVE_HANDLE_COLOR;
+  const fillOpacity = active ? opacity : opacity * INACTIVE_FILL_FACTOR;
 
   return (
     <group>

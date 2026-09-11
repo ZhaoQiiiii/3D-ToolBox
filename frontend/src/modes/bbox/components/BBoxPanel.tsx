@@ -378,7 +378,7 @@ export function BBoxPanel({
           <input
             ref={fileInputRef}
             type="file"
-            accept=".ply,.pcd,.splat,.ksplat"
+            accept=".ply,.pcd,.splat,.ksplat,.spz"
             style={{ display: "none" }}
             onChange={(e) => {
               const file = e.target.files?.[0];
@@ -547,8 +547,22 @@ export function BBoxPanel({
           <button type="button" onClick={onCopy} style={btnStyle}>
             {copied ? "已复制" : "复制"}
           </button>
-          <button type="button" onClick={onSave} style={btnStyle}>
-            {saveState === "saving" ? "保存中…" : saveState === "saved" ? "已保存" : "保存"}
+          <button
+            type="button"
+            onClick={onSave}
+            style={
+              saveState === "error"
+                ? { ...btnStyle, color: "#ff6b6b", borderColor: "#ff6b6b" }
+                : btnStyle
+            }
+          >
+            {saveState === "saving"
+              ? "保存中…"
+              : saveState === "saved"
+                ? "已保存"
+                : saveState === "error"
+                  ? "保存失败"
+                  : "保存"}
           </button>
           <button type="button" onClick={onReset} style={btnStyle}>
             重置

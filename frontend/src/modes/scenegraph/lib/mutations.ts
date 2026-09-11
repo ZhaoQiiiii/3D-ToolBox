@@ -1,0 +1,421 @@
+import type { Mutations, EdgeRef, UpdateArea, UpdateObjectColor } from "./types";
+
+export function emptyMutations(): Mutations {
+  return {
+    deletePolyIds: [],
+    deleteAreaIds: [],
+    movePoly: [],
+    removeEdges: [],
+    addEdges: [],
+    createPoly: [],
+    createObjects: [],
+    updateObjectLabels: [],
+    updateObjectFatherPolys: [],
+    updateObjectPositions: [],
+    updateObjectIds: [],
+    deleteObjectIds: [],
+    objectOrder: [],
+    updateAreas: [],
+    updateObjectColors: [],
+  };
+}
+
+export function mutationCount(m: Mutations): number {
+  return (
+    m.deletePolyIds.length +
+    m.deleteAreaIds.length +
+    m.movePoly.length +
+    m.removeEdges.length +
+    m.addEdges.length +
+    m.createPoly.length +
+    m.createObjects.length +
+    m.updateObjectLabels.length +
+    m.updateObjectFatherPolys.length +
+    m.updateObjectPositions.length +
+    m.updateObjectIds.length +
+    m.deleteObjectIds.length +
+    (m.objectOrder?.length ? 1 : 0) +
+    m.updateAreas.length +
+    m.updateObjectColors.length
+  );
+}
+
+/** Deduplicate an edge key "minId_maxId" */
+export function edgeKey(a: number, b: number): string {
+  return a < b ? `${a}_${b}` : `${b}_${a}`;
+}
+
+export function addDeletePoly(m: Mutations, id: number): Mutations {
+  if (m.deletePolyIds.includes(id)) return m;
+  const mp = shallowCopy(m);
+  mp.deletePolyIds = [...mp.deletePolyIds, id];
+  return mp;
+}
+
+export function addDeleteArea(m: Mutations, id: number): Mutations {
+  if (m.deleteAreaIds.includes(id)) return m;
+  const n = shallowCopy(m);
+  n.deleteAreaIds = [...n.deleteAreaIds, id];
+  return n;
+}
+
+/** Add or replace an area label/color update. Deduplicates by area id. */
+export function addUpdateArea(
+  m: Mutations,
+  patch: UpdateArea,
+): Mutations {
+  const n = shallowCopy(m);
+  const idx = n.updateAreas.findIndex((u) => u.id === patch.id);
+  const merged: UpdateArea = idx >= 0
+    ? {
+        id: patch.id,
+        roomLabel: patch.roomLabel ?? n.updateAreas[idx].roomLabel,
+        color: patch.color
+          ? ([...patch.color] as [number, number, number])
+          : n.updateAreas[idx].color,
+      }
+    : {
+        id: patch.id,
+        roomLabel: patch.roomLabel,
+        color: patch.color ? ([...patch.color] as [number, number, number]) : undefined,
+      };
+  if (idx >= 0) {
+    n.updateAreas[idx] = merged;
+  } else {
+    n.updateAreas = [...n.updateAreas, merged];
+  }
+  return n;
+}
+
+export function addRemoveEdge(m: Mutations, e: EdgeRef): Mutations {
+  const key = edgeKey(e.srcId, e.dstId);
+  if (m.removeEdges.some((r) => edgeKey(r.srcId, r.dstId) === key)) return m;
+  const n = shallowCopy(m);
+  n.removeEdges = [...n.removeEdges, { ...e }];
+  return n;
+}
+
+export function addMovePoly(
+  m: Mutations,
+  id: number,
+  center: [number, number, number],
+): Mutations {
+  const n = shallowCopy(m);
+  const idx = n.movePoly.findIndex((mp) => mp.id === id);
+  if (idx >= 0) {
+    n.movePoly[idx] = { id, center: [...center] };
+  } else {
+    n.movePoly = [...n.movePoly, { id, center: [...center] }];
+  }
+  return n;
+}
+
+export function addAddEdge(m: Mutations, e: EdgeRef): Mutations {
+  const key = edgeKey(e.srcId, e.dstId);
+  if (m.addEdges.some((a) => edgeKey(a.srcId, a.dstId) === key)) return m;
+  const n = shallowCopy(m);
+  n.addEdges = [...n.addEdges, { ...e }];
+  return n;
+}
+
+export function addCreatePoly(
+  m: Mutations,
+  areaId: number,
+  center: [number, number, number],
+  size: number,
+): Mutations {
+  const n = shallowCopy(m);
+  n.createPoly = [...n.createPoly, { areaId, center: [...center] as [number, number, number], size }];
+  return n;
+}
+
+/** Append a new marker object (no point cloud, father_poly_id = -1). */
+export function addCreateObject(
+  m: Mutations,
+  label: string,
+  position: [number, number, number],
+  color: [number, number, number],
+): Mutations {
+  const n = shallowCopy(m);
+  n.createObjects = [
+    ...n.createObjects,
+    {
+      label,
+      position: [...position] as [number, number, number],
+      color: [...color] as [number, number, number],
+    },
+  ];
+  return n;
+}
+
+/**
+ * Move a pending createObjects entry (identified by its display index, i.e.
+ * the synthetic negative id from effectiveObjects) while it has not yet been
+ * exported to a real object id.
+ */
+export function addUpdateCreateObjectPosition(
+  m: Mutations,
+  index: number,
+  position: [number, number, number],
+): Mutations {
+  const n = shallowCopy(m);
+  if (index < 0 || index >= n.createObjects.length) return n;
+  n.createObjects[index] = {
+    ...n.createObjects[index],
+    position: [...position] as [number, number, number],
+  };
+  return n;
+}
+
+/**
+ * Move a pending createPoly entry (identified by its display index, i.e. the
+ * synthetic negative node id from effectiveNodes) while it has not yet been
+ * exported to a real poly id.
+ */
+export function addUpdateCreatePolyCenter(
+  m: Mutations,
+  index: number,
+  center: [number, number, number],
+): Mutations {
+  const n = shallowCopy(m);
+  if (index < 0 || index >= n.createPoly.length) return n;
+  n.createPoly[index] = {
+    ...n.createPoly[index],
+    center: [...center] as [number, number, number],
+  };
+  return n;
+}
+
+/** Edit the label of a pending createObjects entry (synthetic negative id). */
+export function addUpdateCreateObjectLabel(
+  m: Mutations,
+  index: number,
+  label: string,
+): Mutations {
+  const n = shallowCopy(m);
+  if (index < 0 || index >= n.createObjects.length) return n;
+  n.createObjects[index] = { ...n.createObjects[index], label };
+  return n;
+}
+
+/** Edit the color of a pending createObjects entry (synthetic negative id). */
+export function addUpdateCreateObjectColor(
+  m: Mutations,
+  index: number,
+  color: [number, number, number],
+): Mutations {
+  const n = shallowCopy(m);
+  if (index < 0 || index >= n.createObjects.length) return n;
+  n.createObjects[index] = {
+    ...n.createObjects[index],
+    color: [...color] as [number, number, number],
+  };
+  return n;
+}
+
+/** Drop a pending createPoly entry (deleting an unexported new node). */
+export function removeCreatePoly(m: Mutations, index: number): Mutations {
+  const n = shallowCopy(m);
+  if (index < 0 || index >= n.createPoly.length) return n;
+  n.createPoly = n.createPoly.filter((_, i) => i !== index);
+  // Later entries shift down; drop any stale movePoly entries that still
+  // reference the removed synthetic id (defensive — entry points route
+  // synthetic ids to createPoly updates instead of movePoly).
+  const removedId = -(index + 1);
+  n.movePoly = n.movePoly.filter((mp) => mp.id !== removedId);
+  return n;
+}
+
+/**
+ * Drop a pending createObjects entry (deleting an unexported new object).
+ * Later entries shift down, so the synthetic display ids of the remaining
+ * pending objects change (-(k+1) → -k); objectOrder entries referencing
+ * synthetic ids are remapped accordingly.
+ */
+export function removeCreateObject(m: Mutations, index: number): Mutations {
+  const n = shallowCopy(m);
+  if (index < 0 || index >= n.createObjects.length) return n;
+  n.createObjects = n.createObjects.filter((_, i) => i !== index);
+  const removedId = -(index + 1);
+  n.objectOrder = (n.objectOrder ?? [])
+    .map((id) => {
+      if (id === removedId) return null;
+      // More-negative synthetic ids sit after the removed entry and shift
+      // up by one slot: -(k+1) becomes -k.
+      if (id < 0 && id < removedId) return id + 1;
+      return id;
+    })
+    .filter((id): id is number => id !== null);
+  return n;
+}
+
+// ---- object mutations ----
+
+/** Add or replace an object-label update. Deduplicates by object id. */
+export function addUpdateObjectLabel(
+  m: Mutations,
+  id: number,
+  label: string,
+): Mutations {
+  const n = shallowCopy(m);
+  const idx = n.updateObjectLabels.findIndex((u) => u.id === id);
+  if (idx >= 0) {
+    n.updateObjectLabels[idx] = { id, label };
+  } else {
+    n.updateObjectLabels = [...n.updateObjectLabels, { id, label }];
+  }
+  return n;
+}
+
+/** Update an object's father_poly connection. Deduplicates by object id. */
+export function addUpdateObjectFatherPoly(
+  m: Mutations,
+  objectId: number,
+  fatherPolyId: number,
+): Mutations {
+  const n = shallowCopy(m);
+  const idx = n.updateObjectFatherPolys.findIndex((u) => u.objectId === objectId);
+  if (idx >= 0) {
+    n.updateObjectFatherPolys[idx] = { objectId, fatherPolyId };
+  } else {
+    n.updateObjectFatherPolys = [...n.updateObjectFatherPolys, { objectId, fatherPolyId }];
+  }
+  return n;
+}
+
+/** Add or replace an object-position update. Deduplicates by object id. */
+export function addUpdateObjectPosition(
+  m: Mutations,
+  id: number,
+  position: [number, number, number],
+): Mutations {
+  const n = shallowCopy(m);
+  const idx = n.updateObjectPositions.findIndex((u) => u.id === id);
+  if (idx >= 0) {
+    n.updateObjectPositions[idx] = { id, position: [...position] as [number, number, number] };
+  } else {
+    n.updateObjectPositions = [...n.updateObjectPositions, { id, position: [...position] as [number, number, number] }];
+  }
+  return n;
+}
+
+/** Add or replace an object-color update. Deduplicates by object id. */
+export function addUpdateObjectColor(
+  m: Mutations,
+  id: number,
+  color: [number, number, number],
+): Mutations {
+  const n = shallowCopy(m);
+  const idx = n.updateObjectColors.findIndex((u) => u.id === id);
+  const clamped = color.map((c) =>
+    Math.max(0, Math.min(255, Math.round(c))),
+  ) as [number, number, number];
+  if (idx >= 0) {
+    n.updateObjectColors[idx] = { id, color: clamped };
+  } else {
+    n.updateObjectColors = [...n.updateObjectColors, { id, color: clamped }];
+  }
+  return n;
+}
+
+/** Mark an object for deletion. Deduplicates by id. */
+export function addDeleteObject(m: Mutations, id: number): Mutations {
+  if (m.deleteObjectIds.includes(id)) return m;
+  const n = shallowCopy(m);
+  n.deleteObjectIds = [...m.deleteObjectIds, id];
+  n.objectOrder = (n.objectOrder ?? []).filter((oid) => oid !== id);
+  return n;
+}
+
+/** Set the desired export order of object ids (effective/current ids). */
+export function addUpdateObjectOrder(
+  m: Mutations,
+  order: number[],
+): Mutations {
+  const n = shallowCopy(m);
+  n.objectOrder = [...order];
+  return n;
+}
+
+/**
+ * Rename an object (oldId → newId). Because the backend applies
+ * updateObjectIds before every other object mutation, any pending
+ * mutation still referencing oldId is rewritten to newId here.
+ */
+export function addUpdateObjectId(
+  m: Mutations,
+  oldId: number,
+  newId: number,
+): Mutations {
+  const n = shallowCopy(m);
+
+  // Rewrite pending object mutations that still reference oldId
+  n.updateObjectLabels = n.updateObjectLabels.map((u) =>
+    u.id === oldId ? { ...u, id: newId } : u,
+  );
+  n.updateObjectFatherPolys = n.updateObjectFatherPolys.map((u) =>
+    u.objectId === oldId ? { ...u, objectId: newId } : u,
+  );
+  n.updateObjectPositions = n.updateObjectPositions.map((u) =>
+    u.id === oldId ? { ...u, id: newId } : u,
+  );
+  n.updateObjectColors = n.updateObjectColors.map((u) =>
+    u.id === oldId ? { ...u, id: newId } : u,
+  );
+  n.deleteObjectIds = n.deleteObjectIds.map((id) => (id === oldId ? newId : id));
+  n.objectOrder = (n.objectOrder ?? []).map((id) =>
+    id === oldId ? newId : id,
+  );
+
+  // Merge with an existing rename chain: a→oldId becomes a→newId
+  const chainedIdx = n.updateObjectIds.findIndex((u) => u.newId === oldId);
+  if (chainedIdx >= 0) {
+    n.updateObjectIds[chainedIdx] = {
+      ...n.updateObjectIds[chainedIdx],
+      newId,
+    };
+    return n;
+  }
+
+  const idx = n.updateObjectIds.findIndex((u) => u.oldId === oldId);
+  if (idx >= 0) {
+    n.updateObjectIds[idx] = { oldId, newId };
+  } else {
+    n.updateObjectIds = [...n.updateObjectIds, { oldId, newId }];
+  }
+  return n;
+}
+
+function shallowCopy(m: Mutations): Mutations {
+  return {
+    deletePolyIds: [...m.deletePolyIds],
+    deleteAreaIds: [...m.deleteAreaIds],
+    movePoly: m.movePoly.map((x) => ({ ...x })),
+    removeEdges: m.removeEdges.map((x) => ({ ...x })),
+    addEdges: m.addEdges.map((x) => ({ ...x })),
+    createPoly: m.createPoly.map((x) => ({ areaId: x.areaId, center: [...x.center] as [number, number, number], size: x.size })),
+    createObjects: m.createObjects.map((x) => ({
+      label: x.label,
+      position: [...x.position] as [number, number, number],
+      color: [...x.color] as [number, number, number],
+    })),
+    updateObjectLabels: m.updateObjectLabels.map((x) => ({ ...x })),
+    updateObjectFatherPolys: m.updateObjectFatherPolys.map((x) => ({ ...x })),
+    updateObjectPositions: m.updateObjectPositions.map((x) => ({
+      id: x.id,
+      position: [...x.position] as [number, number, number],
+    })),
+    updateObjectIds: m.updateObjectIds.map((x) => ({ ...x })),
+    deleteObjectIds: [...m.deleteObjectIds],
+    objectOrder: [...(m.objectOrder ?? [])],
+    updateAreas: m.updateAreas.map((x) => ({
+      id: x.id,
+      roomLabel: x.roomLabel,
+      color: x.color ? ([...x.color] as [number, number, number]) : undefined,
+    })),
+    updateObjectColors: m.updateObjectColors.map((x) => ({
+      id: x.id,
+      color: [...x.color] as [number, number, number],
+    })),
+  };
+}

@@ -3,16 +3,19 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import * as GaussianSplats3D from "@mkkellogg/gaussian-splats-3d";
 import type { BBoxItem, Vec3 } from "../lib/bbox";
-import { boxEdges, colorForIndex, cornerPositions, centerOf, sizeOf } from "../lib/bbox";
-
-type SplatFormat = "ply" | "splat" | "ksplat" | "spz";
-
-const FORMAT_TO_SCENE_FORMAT: Record<SplatFormat, number> = {
-  ply: GaussianSplats3D.SceneFormat.Ply,
-  splat: GaussianSplats3D.SceneFormat.Splat,
-  ksplat: GaussianSplats3D.SceneFormat.KSplat,
-  spz: GaussianSplats3D.SceneFormat.Spz,
-};
+import {
+  INACTIVE_EDGE_COLOR,
+  INACTIVE_FILL_FACTOR,
+  INACTIVE_HANDLE_COLOR,
+  MIN_EDGE_RADIUS,
+  boxEdges,
+  centerOf,
+  colorForIndex,
+  cornerPositions,
+  sizeOf,
+} from "../lib/bbox";
+import { FORMAT_TO_SCENE_FORMAT, type SplatFormat } from "../../../shared/splat-format";
+import { Z_UP, rayHitHorizontalPlane, verticalDragWorld } from "../../../shared/lib/projection";
 
 // A CylinderGeometry is aligned along its local +Y axis, so to orient an edge
 // cylinder we rotate +Y onto the edge direction (same as BBoxLayer.tsx). This
@@ -53,12 +56,12 @@ function buildBoxVisual(
   const corners = cornerPositions(box.min, box.max);
   const edges = boxEdges();
   const color = colorForIndex(index);
-  const edgeColor = active ? color : "#7a7a7a";
-  const handleColor = active ? color : "#9a9a9a";
-  const radius = Math.max(0.0005, lineWidth / 2);
+  const edgeColor = active ? color : INACTIVE_EDGE_COLOR;
+  const handleColor = active ? color : INACTIVE_HANDLE_COLOR;
+  const radius = Math.max(MIN_EDGE_RADIUS, lineWidth / 2);
   const center = centerOf(box.min, box.max);
   const size = sizeOf(box.min, box.max);
-  const fillOpacity = active ? opacity : opacity * 0.55;
+  const fillOpacity = active ? opacity : opacity * INACTIVE_FILL_FACTOR;
 
   for (const [a, b] of edges) {
     addEdgeCylinder(parent, corners[a]!, corners[b]!, radius, edgeColor);
@@ -210,7 +213,6 @@ export function GaussianSplatViewer({
 
     const raycaster = new THREE.Raycaster();
     const ndc = new THREE.Vector2();
-    const planeNormal = new THREE.Vector3(0, 0, 1);
 
     setLoading(true);
     setError(null);
@@ -246,35 +248,28 @@ export function GaussianSplatViewer({
     // splat scene is Z-up, so the horizontal floor is the XY plane).
     const planeAtZ = (clientX: number, clientY: number, z: number): Vec3 | null => {
       setRay(clientX, clientY);
-      const plane = new THREE.Plane(planeNormal, -z);
-      const hit = new THREE.Vector3();
-      const r = raycaster.ray.intersectPlane(plane, hit);
-      if (!r) return null;
+      const hit = rayHitHorizontalPlane(raycaster.ray, Z_UP, new THREE.Vector3(0, 0, z));
+      if (!hit) return null;
       return [hit.x, hit.y, hit.z];
     };
 
     // For vertical (right-button) drags: keep the corner's X/Y fixed and follow
-    // the cursor along the scene's up axis (Z). We intersect the pointer ray
-    // with a vertical plane through (startX, startY) that faces the camera.
+    // the cursor along the scene's up axis (Z). The shared helper intersects
+    // the pointer ray with a camera-facing vertical plane through the corner
+    // and falls back to screen-space mapping near top-down cameras.
     const verticalZAt = (
       clientX: number,
       clientY: number,
       startX: number,
       startY: number,
+      startZ: number,
     ): Vec3 | null => {
-      setRay(clientX, clientY);
-      const cameraDir = viewer.camera.getWorldDirection(new THREE.Vector3());
-      const horiz = new THREE.Vector3(cameraDir.x, cameraDir.y, 0);
-      if (horiz.lengthSq() < 1e-6) horiz.set(1, 0, 0);
-      else horiz.normalize();
-
-      const normal = new THREE.Vector3().crossVectors(planeNormal, horiz).normalize();
-      const anchor = new THREE.Vector3(startX, startY, 0);
-      const plane = new THREE.Plane(normal, -normal.dot(anchor));
-      const hit = new THREE.Vector3();
-      const r = raycaster.ray.intersectPlane(plane, hit);
-      if (!r) return null;
-      return [startX, startY, hit.z];
+      const rect = setRay(clientX, clientY);
+      const cam = viewer.camera as THREE.PerspectiveCamera;
+      const anchor = new THREE.Vector3(startX, startY, startZ);
+      const next = verticalDragWorld(cam, raycaster.ray, clientX, clientY, rect, anchor, Z_UP);
+      if (!next) return null;
+      return [startX, startY, next.z];
     };
 
     const pickPoint = (clientX: number, clientY: number, anchorZ: number): Vec3 | null => {
@@ -341,7 +336,7 @@ export function GaussianSplatViewer({
       if (!drag || e.pointerId !== drag.pointerId) return;
       const local =
         drag.button === 2
-          ? verticalZAt(e.clientX, e.clientY, drag.startX, drag.startY)
+          ? verticalZAt(e.clientX, e.clientY, drag.startX, drag.startY, drag.startZ)
           : planeAtZ(e.clientX, e.clientY, drag.startZ);
       if (local) latestRef.current.onDrag(drag.boxId, drag.corner, local);
     };
@@ -435,6 +430,10 @@ export function GaussianSplatViewer({
         dom.removeEventListener("contextmenu", onContextMenu, { capture: true } as any);
       }
       if (controls) controls.dispose();
+      // Free the overlay's geometries/materials (box edges, fills, corner
+      // spheres, draft anchor): the library's dispose() only releases the
+      // splat/GPU resources it owns, not the objects we attached to the scene.
+      disposeObject(overlay);
       // dispose() detaches the canvas from `rootElement`, then tries to remove
       // `rootElement` from document.body — which is not its real parent here,
       // so swallow that final error; all GPU/worker resources are freed before.
