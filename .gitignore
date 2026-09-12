@@ -1,7 +1,31 @@
+# Dependencies (Bun is the canonical package manager; see bun.lock)
 node_modules/
+package-lock.json
+
+# Build output
 frontend/dist/
+
+# Local env / secrets (never commit API keys — env vars only)
+.env
+.env.*
+!.env.example
+*.local
+
+# Tool outputs (legacy single-result file; regenerated per run)
 bbox_result.json
+
+# Runtime-switchable data-root persistence (server-local paths)
+.runtime-state.json
+
+# Runtime logs
 logs/
+*.log
+
+# Scene data (large point clouds / splats — keep only the dir placeholder)
 pcd/*
 !pcd/.gitkeep
+bboxes/
 
+# OS junk
+.DS_Store
+Thumbs.db

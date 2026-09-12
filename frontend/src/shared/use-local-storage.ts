@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 /**
  * Create a `useLocalStorageState` hook scoped to a storage-key prefix.
@@ -14,7 +14,7 @@ export function createLocalStorageHook(prefix: string) {
   return function useLocalStorageState<T>(
     key: string,
     fallback: T,
-  ): [T, (v: T) => void] {
+  ): [T, (v: T | ((prev: T) => T)) => void] {
     const [value, setValue] = useState<T>(() => {
       try {
         const stored = localStorage.getItem(`${prefix}${key}`);
@@ -23,14 +23,23 @@ export function createLocalStorageHook(prefix: string) {
       return fallback;
     });
     const set = useCallback(
-      (v: T) => {
-        setValue(v);
-        try {
-          localStorage.setItem(`${prefix}${key}`, JSON.stringify(v));
-        } catch {}
+      (v: T | ((prev: T) => T)) => {
+        // The updater must stay pure: React may invoke it on renders that
+        // are later discarded (StrictMode double-invocation, concurrent
+        // transitions), so persisting from inside it could let storage
+        // run ahead of the committed state. Persistence happens in the
+        // effect below, after the value commits.
+        setValue((prev) =>
+          typeof v === "function" ? (v as (prev: T) => T)(prev) : v,
+        );
       },
       [key],
     );
+    useEffect(() => {
+      try {
+        localStorage.setItem(`${prefix}${key}`, JSON.stringify(value));
+      } catch {}
+    }, [prefix, key, value]);
     return [value, set];
   };
 }

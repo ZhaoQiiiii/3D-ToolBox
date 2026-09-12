@@ -1,10 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import * as GaussianSplats3D from "@mkkellogg/gaussian-splats-3d";
-import {
-  FORMAT_TO_SCENE_FORMAT,
-  type SplatFormat,
-} from "../../../shared/splat-format";
+import { FORMAT_TO_SCENE_FORMAT, type SplatFormat } from "../splat-format";
 
 // ---------------------------------------------------------------------------
 // Single-instance in-page cache.
@@ -66,12 +63,12 @@ function getViewer(src: string, format: SplatFormat): CacheEntry {
 }
 
 /**
- * Dispose the module-level splat cache. Called when the SceneGraph mode
- * unmounts (mode switch): the cached viewer holds GPU textures for the
- * currently-loaded file (~450MB PLY parsed + uploaded), and the BBox mode
- * loads its own copy of the same scene — keeping both would double GPU
- * memory. Disposing here means switching back re-parses the file, which is
- * the accepted trade-off.
+ * Dispose the module-level splat cache. Called when a mode that uses this
+ * layer unmounts (mode switch): the cached viewer holds GPU textures for the
+ * currently-loaded file (~450MB PLY parsed + uploaded), and other modes load
+ * their own copy of the same scene — keeping both would double GPU memory.
+ * Disposing here means switching back re-parses the file, which is the
+ * accepted trade-off.
  */
 export function disposeSplatCache(): void {
   if (!cache) return;
@@ -106,13 +103,24 @@ export function GaussianSplatLayer({
   format,
   onLoadingChange,
   onError,
+  onViewer,
 }: {
   src: string;
   format: SplatFormat;
   onLoadingChange?: (loading: boolean) => void;
   onError?: (message: string | null) => void;
+  /**
+   * Notified with the internal DropInViewer when it becomes active (so
+   * consumers can raycast against the splat surface) and with null on
+   * cleanup / source change.
+   */
+  onViewer?: (viewer: GaussianSplats3D.DropInViewer | null) => void;
 }) {
   const groupRef = useRef<THREE.Group>(null);
+  // Keep the callback in a ref: the effect below intentionally only re-runs
+  // on src/format changes, so it must always see the latest callback.
+  const onViewerRef = useRef(onViewer);
+  onViewerRef.current = onViewer;
 
   useEffect(() => {
     const parent = groupRef.current;
@@ -123,6 +131,7 @@ export function GaussianSplatLayer({
 
     // Reuse (or create) the cached viewer for this file.
     const entry = getViewer(src, format);
+    onViewerRef.current?.(entry.viewer);
 
     onLoadingChange?.(true);
     onError?.(null);
@@ -153,6 +162,7 @@ export function GaussianSplatLayer({
 
     return () => {
       disposed = true;
+      onViewerRef.current?.(null);
       // Detach only — do NOT dispose. The cached viewer stays alive so
       // toggling render mode back renders instantly from its GPU buffers.
       if (attached) parent.remove(entry.viewer);

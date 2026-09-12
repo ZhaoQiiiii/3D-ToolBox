@@ -11,18 +11,24 @@ const SceneGraphMode = lazy(() =>
     default: m.SceneGraphMode,
   })),
 );
+const TrajectoryMode = lazy(() =>
+  import("./modes/traj/TrajectoryMode").then((m) => ({
+    default: m.TrajectoryMode,
+  })),
+);
 
-type AppMode = "bbox" | "scenegraph";
+type AppMode = "bbox" | "scenegraph" | "traj";
 
 const MODE_LABELS: Array<{ id: AppMode; label: string }> = [
   { id: "bbox", label: "3D-BBox 标注" },
   { id: "scenegraph", label: "SceneGraph 编辑" },
+  { id: "traj", label: "Trajectory 可视化" },
 ];
 
 function loadStoredMode(): AppMode {
   try {
     const v = localStorage.getItem("3dbbox_appMode");
-    if (v === "bbox" || v === "scenegraph") return v;
+    if (v === "bbox" || v === "scenegraph" || v === "traj") return v;
   } catch {}
   return "bbox";
 }
@@ -57,7 +63,13 @@ export function App() {
       </div>
 
       <Suspense fallback={<div style={fallbackStyle}>Loading…</div>}>
-        {mode === "bbox" ? <BBoxMode /> : <SceneGraphMode />}
+        {mode === "bbox" ? (
+          <BBoxMode />
+        ) : mode === "scenegraph" ? (
+          <SceneGraphMode />
+        ) : (
+          <TrajectoryMode />
+        )}
       </Suspense>
     </div>
   );

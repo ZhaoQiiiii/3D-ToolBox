@@ -21,6 +21,15 @@
  * - POST /api/export                        → apply mutations, write exported/
  * - POST /api/log                           → client-side event sink
  *
+ * ── Trajectory visualization mode ────────────────────────────────────
+ * The user supplies an arbitrary server path to a worldmodel
+ * flight_…/step_… directory. Everything is strictly read-only; only
+ * whitelisted well-known artifact names can be read out of a step dir.
+ *
+ * - GET  /api/traj-browse?path=…  → smart listing (step/flight/dir levels)
+ * - GET  /api/traj-file?path=…&name=…    → whitelisted step JSON artifacts
+ * - GET  /api/traj-asset?path=…&name=…   → anchor.jpg / video.mp4 (Range-capable)
+ *
  * Route split for /api/pcd: SceneGraph-mode requests always carry `snapshot`
  * or `source`; a plain `?name=` belongs to the BBox mode. The split is made
  * on that explicit criteria (NOT query shape guessing).
@@ -40,7 +49,7 @@ import {
   rmSync,
 } from "node:fs";
 import { copyFile, mkdir } from "node:fs/promises";
-import { join, dirname, resolve } from "node:path";
+import { join, dirname, resolve, basename, isAbsolute } from "node:path";
 import type {
   MovePoly,
   EdgeRef,
@@ -94,6 +103,26 @@ function readJson(path: string): any {
   return JSON.parse(readFileSync(path, "utf-8"));
 }
 
+/**
+ * Load the persisted runtime-switchable data roots (`.runtime-state.json`
+ * next to the backend). Written whenever the UI switches the cloud or
+ * SceneGraph data root, so a dev-server restart keeps the user's paths.
+ * Returns empty fields when the file is missing or unreadable.
+ */
+function loadRuntimeState(): { pcdRoot?: string; sgRoot?: string } {
+  try {
+    const j = readJson(
+      join(import.meta.dirname, "..", ".runtime-state.json"),
+    );
+    return {
+      pcdRoot: typeof j?.pcdRoot === "string" ? j.pcdRoot : undefined,
+      sgRoot: typeof j?.sgRoot === "string" ? j.sgRoot : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
 function writeJson(path: string, data: any): void {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(data, null, 2) + "\n");
@@ -133,6 +162,113 @@ function isCloudFileName(name: string): boolean {
 /** Any asset extension the BBox tool knows (used for bbox persistence keys). */
 function isKnownAssetName(name: string): boolean {
   return CLOUD_FILE_RE.test(name);
+}
+
+// ---- Trajectory mode (worldmodel flight/step browsing) ----
+
+/**
+ * Whitelist of the well-known artifact file names a step directory contains.
+ * The step directory PATH is user-supplied (arbitrary server path — local dev
+ * tool), but only these exact names can ever be read out of it: no arbitrary
+ * file read, no directory listing of unrelated files.
+ */
+const TRAJ_JSON_FILES = new Set([
+  "trajectory.json",
+  "prompt.json",
+  "result.json",
+  "wm_result.json",
+  "target_extraction.json",
+  "video_response.json",
+  "lidar_depth.json",
+]);
+
+/** Binary artifacts with their serving content types. */
+const TRAJ_ASSET_TYPES: Record<string, string> = {
+  "anchor.jpg": "image/jpeg",
+  "video.mp4": "video/mp4",
+};
+
+/**
+ * Validate a user-supplied trajectory directory path: must be absolute and
+ * free of NUL bytes. `..` components are harmless here (the user picks real
+ * server paths and the file NAME is whitelisted), but NUL would corrupt the
+ * underlying syscalls.
+ */
+function isValidTrajDirPath(p: unknown): p is string {
+  return typeof p === "string" && p.length > 0 && !p.includes("\0") && isAbsolute(p);
+}
+
+/** Step availability info for browse listings. */
+function trajStepInfo(dir: string): {
+  name: string;
+  path: string;
+  hasTrajectory: boolean;
+  hasVideo: boolean;
+} {
+  const has = (f: string) => {
+    try {
+      statSync(join(dir, f));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  return {
+    name: basename(dir),
+    path: dir,
+    hasTrajectory: has("trajectory.json"),
+    hasVideo: has("video.mp4"),
+  };
+}
+
+/**
+ * Stream a binary asset with HTTP Range support so <video> seeking works.
+ * Video elements issue Range requests; without 206 responses scrubbing breaks.
+ */
+function streamTrajAsset(
+  res: ServerResponse,
+  filePath: string,
+  contentType: string,
+  rangeHeader: string | undefined,
+): void {
+  let size: number;
+  try {
+    size = statSync(filePath).size;
+  } catch {
+    sendJson(res, 404, { success: false, error: "File not found" });
+    return;
+  }
+  const range = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader || "");
+  if (range) {
+    const start = range[1] === "" ? 0 : parseInt(range[1]!, 10);
+    const rawEnd = range[2] === "" ? size - 1 : parseInt(range[2]!, 10);
+    if (
+      !Number.isFinite(start) ||
+      !Number.isFinite(rawEnd) ||
+      start < 0 ||
+      start > rawEnd ||
+      start >= size
+    ) {
+      res.writeHead(416, { "Content-Range": `bytes */${size}` });
+      res.end();
+      return;
+    }
+    const end = Math.min(rawEnd, size - 1);
+    res.writeHead(206, {
+      "Content-Type": contentType,
+      "Content-Range": `bytes ${start}-${end}/${size}`,
+      "Accept-Ranges": "bytes",
+      "Content-Length": end - start + 1,
+    });
+    createReadStream(filePath, { start, end }).pipe(res);
+    return;
+  }
+  res.writeHead(200, {
+    "Content-Type": contentType,
+    "Content-Length": size,
+    "Accept-Ranges": "bytes",
+  });
+  createReadStream(filePath).pipe(res);
 }
 
 /** Validate the POSTed boxes array (the shape toBBoxOutput produces). */
@@ -1096,14 +1232,33 @@ function logToFile(scope: string, event: string, detail?: unknown): void {
 export function apiPlugin(): Plugin {
   const PROJECT_ROOT = join(import.meta.dirname, "..");
   const BBOX_DIR = join(PROJECT_ROOT, "bboxes");
-  const PCD_DIR = join(PROJECT_ROOT, "pcd");
+  // Runtime-switchable cloud/splat data root (the ?name= / ?source=scene
+  // lookups and the file listing all read from it). Initialization order:
+  // persisted runtime state (last used in the UI) > PCD_ROOT env var > the
+  // bundled pcd/ directory.
+  const runtimeState = loadRuntimeState();
+  let PCD_ROOT = resolve(
+    runtimeState.pcdRoot || process.env.PCD_ROOT || join(PROJECT_ROOT, "pcd"),
+  );
 
   // SceneGraph snapshot data root (scene_graph_saved/ + scene_graph_exported/
   // live there). Defaults to the sibling scenegraph_editor repo; override
-  // with SG_ROOT (e.g. to relocate the data or run standalone).
-  const SG_ROOT = resolve(
-    process.env.SG_ROOT || join(PROJECT_ROOT, "..", "scenegraph_editor"),
+  // with SG_ROOT at startup (e.g. to relocate the data or run standalone),
+  // or at RUNTIME through POST /api/sg-root (the UI's data-root picker).
+  let SG_ROOT = resolve(
+    runtimeState.sgRoot || process.env.SG_ROOT || join(PROJECT_ROOT, "..", "scenegraph_editor"),
   );
+
+  function persistRuntimeState() {
+    try {
+      writeFileSync(
+        join(PROJECT_ROOT, ".runtime-state.json"),
+        JSON.stringify({ pcdRoot: PCD_ROOT, sgRoot: SG_ROOT }, null, 2) + "\n",
+      );
+    } catch {
+      // Non-fatal: the roots stay effective for this server run.
+    }
+  }
 
   // Initialize the log directory on plugin setup. Each `bun run dev` restart
   // gets its own timestamped file: logs/YYYY-MM-DD_HH-MM-SS.log
@@ -1126,7 +1281,7 @@ export function apiPlugin(): Plugin {
         res: ServerResponse,
       ) => {
         try {
-          const files = readdirSync(PCD_DIR)
+          const files = readdirSync(PCD_ROOT)
             .filter((f) => isCloudFileName(f))
             .map((f) => ({ name: f }));
           sendJson(res, 200, { files });
@@ -1136,6 +1291,64 @@ export function apiPlugin(): Plugin {
       };
       server.middlewares.use("/api/pointcloud-files", listCloudFiles);
       server.middlewares.use("/api/scene-pcds", listCloudFiles);
+
+      // Get / switch the cloud/splat data root at runtime (shared by the
+      // BBox, SceneGraph scene base and Trajectory scene file listings).
+      // POST body: { path: "<absolute server path>" }. Any readable
+      // directory is accepted; an empty one simply lists no files.
+      server.middlewares.use(
+        "/api/pcd-root",
+        async (req: IncomingMessage, res: ServerResponse) => {
+          try {
+            if (req.method === "GET") {
+              sendJson(res, 200, { root: PCD_ROOT });
+              return;
+            }
+            if (req.method !== "POST") {
+              sendJson(res, 405, { success: false, error: "Method not allowed" });
+              return;
+            }
+            // readBody enforces the shared MAX_BODY_BYTES cap (the raw
+            // req.on("data") accumulation it replaced was unbounded).
+            const body = await readBody(req);
+            try {
+              const parsed = JSON.parse(body || "{}") as { path?: unknown };
+              const path = parsed.path;
+              if (
+                typeof path !== "string" ||
+                path.length === 0 ||
+                path.includes("\0") ||
+                !isAbsolute(path)
+              ) {
+                sendJson(res, 400, {
+                  success: false,
+                  error: "Invalid path (must be absolute)",
+                });
+                return;
+              }
+              const root = resolve(path);
+              let st;
+              try {
+                st = statSync(root);
+              } catch {
+                sendJson(res, 404, { success: false, error: "Path not found" });
+                return;
+              }
+              if (!st.isDirectory()) {
+                sendJson(res, 400, { success: false, error: "Path is not a directory" });
+                return;
+              }
+              PCD_ROOT = root;
+              persistRuntimeState();
+              sendJson(res, 200, { success: true, root: PCD_ROOT });
+            } catch (err: any) {
+              sendJson(res, 500, { success: false, error: err.message });
+            }
+          } catch (err: any) {
+            sendJson(res, 500, { success: false, error: err.message });
+          }
+        },
+      );
 
       // Unified cloud/splat file endpoint, shared by both modes.
       //
@@ -1174,7 +1387,7 @@ export function apiPlugin(): Plugin {
                   sendJson(res, 400, { success: false, error: "Invalid name" });
                   return;
                 }
-                filePath = join(PCD_DIR, name);
+                filePath = join(PCD_ROOT, name);
               } else {
                 const relPath = url.searchParams.get("path");
                 if (
@@ -1209,7 +1422,7 @@ export function apiPlugin(): Plugin {
                 sendJson(res, 400, { success: false, error: "Invalid name" });
                 return;
               }
-              filePath = join(PCD_DIR, name);
+              filePath = join(PCD_ROOT, name);
             }
 
             streamFile(res, filePath);
@@ -1434,6 +1647,71 @@ export function apiPlugin(): Plugin {
         },
       );
 
+      // Get / switch the SceneGraph data root at runtime (UI path picker).
+      // POST body: { path: "<absolute server path>" }. The directory must
+      // contain a scene_graph_saved/ subdir with snapshots, otherwise 400.
+      server.middlewares.use(
+        "/api/sg-root",
+        async (req: IncomingMessage, res: ServerResponse) => {
+          try {
+            if (req.method === "GET") {
+              sendJson(res, 200, { root: SG_ROOT });
+              return;
+            }
+            if (req.method !== "POST") {
+              sendJson(res, 405, { success: false, error: "Method not allowed" });
+              return;
+            }
+            // readBody enforces the shared MAX_BODY_BYTES cap (the raw
+            // req.on("data") accumulation it replaced was unbounded).
+            const body = await readBody(req);
+            try {
+              const parsed = JSON.parse(body || "{}") as { path?: unknown };
+              const path = parsed.path;
+              if (
+                typeof path !== "string" ||
+                path.length === 0 ||
+                path.includes("\0") ||
+                !isAbsolute(path)
+              ) {
+                sendJson(res, 400, {
+                  success: false,
+                  error: "Invalid path (must be absolute)",
+                });
+                return;
+              }
+              const root = resolve(path);
+              let st;
+              try {
+                st = statSync(root);
+              } catch {
+                sendJson(res, 404, { success: false, error: "Path not found" });
+                return;
+              }
+              if (!st.isDirectory()) {
+                sendJson(res, 400, { success: false, error: "Path is not a directory" });
+                return;
+              }
+              try {
+                statSync(join(root, "scene_graph_saved"));
+              } catch {
+                sendJson(res, 400, {
+                  success: false,
+                  error: "所选路径下没有 scene_graph_saved/ 目录",
+                });
+                return;
+              }
+              SG_ROOT = root;
+              sendJson(res, 200, { success: true, root: SG_ROOT });
+            } catch (err: any) {
+              sendJson(res, 500, { success: false, error: err.message });
+            }
+          } catch (err: any) {
+            sendJson(res, 500, { success: false, error: err.message });
+          }
+        },
+      );
+
       // List all available snapshots from scene_graph_saved/
       server.middlewares.use(
         "/api/snapshots",
@@ -1529,6 +1807,149 @@ export function apiPlugin(): Plugin {
               "X-Scene-Source": jsonPath === exportedPath ? "exported" : "saved",
             });
             res.end(data);
+          } catch (err: any) {
+            sendJson(res, 500, { success: false, error: err.message });
+          }
+        },
+      );
+
+      // ---- Trajectory mode: read-only browsing of worldmodel flight/step dirs ----
+      //
+      // GET /api/traj-browse?path=<abs server path>
+      //   Smart listing: a step_* dir → itself; a flight_* dir → its steps;
+      //   any other dir → the flight_*/step_* entries directly inside.
+      // GET /api/traj-file?path=<step dir>&name=<whitelisted json>
+      // GET /api/traj-asset?path=<step dir>&name=(anchor.jpg|video.mp4)
+      //   Binary stream with Range support (video scrubbing).
+
+      server.middlewares.use(
+        "/api/traj-browse",
+        async (req: IncomingMessage, res: ServerResponse) => {
+          if (req.method !== "GET") {
+            sendJson(res, 405, { success: false, error: "Method not allowed" });
+            return;
+          }
+          try {
+            const url = new URL(
+              req.url || "",
+              `http://${req.headers.host || "localhost"}`,
+            );
+            const raw = url.searchParams.get("path");
+            if (!isValidTrajDirPath(raw)) {
+              sendJson(res, 400, {
+                success: false,
+                error: "Missing/invalid absolute path",
+              });
+              return;
+            }
+            let st;
+            try {
+              st = statSync(raw);
+            } catch {
+              sendJson(res, 404, { success: false, error: "Path not found" });
+              return;
+            }
+            if (!st.isDirectory()) {
+              sendJson(res, 400, { success: false, error: "Path is not a directory" });
+              return;
+            }
+
+            const base = basename(raw);
+            if (base.startsWith("step_")) {
+              sendJson(res, 200, { kind: "step", path: raw, step: trajStepInfo(raw) });
+              return;
+            }
+
+            // Only ever list flight_*/step_* entries — no generic listing.
+            const entries = readdirSync(raw, { withFileTypes: true })
+              .filter((d) => d.isDirectory())
+              .map((d) => d.name)
+              .filter((n) => n.startsWith("flight_") || n.startsWith("step_"))
+              .sort();
+
+            if (base.startsWith("flight_")) {
+              sendJson(res, 200, {
+                kind: "flight",
+                path: raw,
+                steps: entries
+                  .filter((n) => n.startsWith("step_"))
+                  .map((n) => trajStepInfo(join(raw, n))),
+              });
+              return;
+            }
+            sendJson(res, 200, {
+              kind: "dir",
+              path: raw,
+              flights: entries
+                .filter((n) => n.startsWith("flight_"))
+                .map((n) => ({ name: n, path: join(raw, n) })),
+              steps: entries
+                .filter((n) => n.startsWith("step_"))
+                .map((n) => trajStepInfo(join(raw, n))),
+            });
+          } catch (err: any) {
+            sendJson(res, 500, { success: false, error: err.message });
+          }
+        },
+      );
+
+      server.middlewares.use(
+        "/api/traj-file",
+        async (req: IncomingMessage, res: ServerResponse) => {
+          if (req.method !== "GET") {
+            sendJson(res, 405, { success: false, error: "Method not allowed" });
+            return;
+          }
+          try {
+            const url = new URL(
+              req.url || "",
+              `http://${req.headers.host || "localhost"}`,
+            );
+            const dir = url.searchParams.get("path");
+            const name = url.searchParams.get("name");
+            if (!isValidTrajDirPath(dir) || !name || !TRAJ_JSON_FILES.has(name)) {
+              sendJson(res, 400, { success: false, error: "Invalid path or file name" });
+              return;
+            }
+            const filePath = join(dir, name);
+            let data: string;
+            try {
+              data = readFileSync(filePath, "utf-8");
+            } catch {
+              sendJson(res, 404, { success: false, error: "File not found" });
+              return;
+            }
+            res.writeHead(200, {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*",
+            });
+            res.end(data);
+          } catch (err: any) {
+            sendJson(res, 500, { success: false, error: err.message });
+          }
+        },
+      );
+
+      server.middlewares.use(
+        "/api/traj-asset",
+        async (req: IncomingMessage, res: ServerResponse) => {
+          if (req.method !== "GET") {
+            sendJson(res, 405, { success: false, error: "Method not allowed" });
+            return;
+          }
+          try {
+            const url = new URL(
+              req.url || "",
+              `http://${req.headers.host || "localhost"}`,
+            );
+            const dir = url.searchParams.get("path");
+            const name = url.searchParams.get("name");
+            const contentType = name ? TRAJ_ASSET_TYPES[name] : undefined;
+            if (!isValidTrajDirPath(dir) || !contentType) {
+              sendJson(res, 400, { success: false, error: "Invalid path or asset name" });
+              return;
+            }
+            streamTrajAsset(res, join(dir, name), contentType, req.headers.range);
           } catch (err: any) {
             sendJson(res, 500, { success: false, error: err.message });
           }

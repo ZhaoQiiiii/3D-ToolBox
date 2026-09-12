@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { BBoxItem, Vec3 } from "../lib/bbox";
 import { colorForIndex } from "../lib/bbox";
+import { CloudRootPicker } from "../../../shared/components/CloudRootPicker";
 
 const SLIDER_RANGES: Record<"x" | "y" | "z", [number, number]> = {
   x: [-30.0, 50.0],
@@ -48,6 +49,7 @@ interface Props {
   copied: boolean;
   cloudFiles: string[];
   selectedCloud: string;
+  onCloudRootChanged?: () => void;
   renderMode: "pointcloud" | "3dgs";
   onRenderMode: (mode: "pointcloud" | "3dgs") => void;
   onImportFile: (file: File) => void;
@@ -297,6 +299,7 @@ export function BBoxPanel({
   copied,
   cloudFiles,
   selectedCloud,
+  onCloudRootChanged,
   renderMode,
   onRenderMode,
   onImportFile,
@@ -323,10 +326,14 @@ export function BBoxPanel({
 
   return (
     <div data-overlay style={PANEL_STYLE}>
-      <div style={{ color: "#fff", fontWeight: 700, fontSize: 15 }}>3D-BBox  Tool</div>
+      <div style={{ color: "#fff", fontWeight: 700, fontSize: 15 }}>3D-ToolBox</div>
 
       <div style={{ marginTop: 8 }}>
         <div style={{ color: "#fff", fontWeight: 700, fontSize: 14, marginBottom: 6 }}>基本参数</div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <CloudRootPicker onRootChanged={onCloudRootChanged} />
+        </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span style={labelStyle}>点云文件</span>

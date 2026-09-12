@@ -20,7 +20,8 @@ import { ObjectsListPanel } from "./components/ObjectsListPanel";
 import { AddNodePanel } from "./components/AddNodePanel";
 import { AddObjectPanel } from "./components/AddObjectPanel";
 import { PointCloudLayer, type PcdColorScheme, SCHEME_LABELS } from "../../shared/components/PointCloudLayer";
-import { GaussianSplatLayer, disposeSplatCache } from "./components/GaussianSplatLayer";
+import { GaussianSplatLayer, disposeSplatCache } from "../../shared/components/GaussianSplatLayer";
+import { CloudRootPicker } from "../../shared/components/CloudRootPicker";
 import { splatFormatOf, type SplatFormat } from "../../shared/splat-format";
 import { createLocalStorageHook } from "../../shared/use-local-storage";
 import { useCloudFiles } from "../../shared/use-cloud-files";
@@ -1319,6 +1320,11 @@ export function SceneGraphMode() {
   const [data, setData] = useState<SceneData | null>(null);
   const [snapshot, setSnapshot] = useState<string>("");
   const [snapshots, setSnapshots] = useState<{ name: string; saved_at: string; summary: any }[]>([]);
+  // Data-root picker state (POST /api/sg-root switches the server-side root).
+  const [sgRoot, setSgRoot] = useState<string>("");
+  const [sgRootInput, setSgRootInput] = useState<string>("");
+  const [sgRootError, setSgRootError] = useState<string | null>(null);
+  const [rootVersion, setRootVersion] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [layers, setLayers] = useState<Layers>({
@@ -1385,7 +1391,9 @@ export function SceneGraphMode() {
   const [pcdLayers, setPcdLayers] = useState<{ key: string; positions: Float32Array; colorHex: string }[]>([]);
   const [pcdLoading, setPcdLoading] = useState(false);
   // Available scene-level cloud/splat files (shared fetch hook).
-  const scenePcds = useCloudFiles("/api/scene-pcds");
+  const { files: scenePcds, reload: reloadScenePcds } = useCloudFiles(
+    "/api/scene-pcds",
+  );
   // Cache parsed scene-level clouds so export reload doesn't re-parse huge files.
   const scenePcdCacheRef = useRef(new Map<string, { positions: Float32Array; colorHex: string }>());
 
@@ -1505,6 +1513,60 @@ export function SceneGraphMode() {
     });
   }, []);
 
+  // Current data root (displayed as the picker's placeholder). Re-fetched
+  // whenever rootVersion changes (i.e. after a successful switch).
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch("/api/sg-root");
+        if (r.ok) {
+          const j = await r.json();
+          if (typeof j.root === "string") setSgRoot(j.root);
+        }
+      } catch {
+        /* keep whatever root we already had */
+      }
+    })();
+  }, [rootVersion]);
+
+  // Switch the server-side data root, then re-list snapshots from it.
+  const applySgRoot = useCallback(async () => {
+    const p = sgRootInput.trim();
+    if (!p) return;
+    setSgRootError(null);
+    try {
+      const r = await fetch("/api/sg-root", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: p }),
+      });
+      const j = (await r.json().catch(() => null)) as
+        | { root?: string; error?: string }
+        | null;
+      if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
+      setSgRoot(j?.root ?? p);
+      // Reset all snapshot-derived state the same way a snapshot switch does,
+      // then let Phase 1 re-run against the new root.
+      setSnapshot("");
+      setData(null);
+      setEditHistory(createHistory(emptyMutations()));
+      setSelectedNodeIds(new Set());
+      setSelectedEdgeKey(null);
+      setSelectedObjectIds(new Set());
+      setPreviewObjectPositions(new Map());
+      setPreviewNodePositions(new Map());
+      setBase("saved");
+      setError(null);
+      setSelectedPcd(null);
+      setPcdLayers([]);
+      scenePcdCacheRef.current.clear();
+      setSnapshots([]);
+      setRootVersion((v) => v + 1);
+    } catch (e) {
+      setSgRootError(e instanceof Error ? e.message : String(e));
+    }
+  }, [sgRootInput]);
+
   // Phase 1: list all snapshots
   useEffect(() => {
     (async () => {
@@ -1524,7 +1586,7 @@ export function SceneGraphMode() {
         setLoading(false);
       }
     })();
-  }, []);
+  }, [rootVersion]);
 
   // Phase 2: load scene graph for selected snapshot
   useEffect(() => {
@@ -2332,28 +2394,30 @@ export function SceneGraphMode() {
         </div>
       )}
 
-      {/* Snapshot selector + scene graph summary */}
-      {snapshots.length > 0 && snapshot !== "" && (
-        <div
-          data-overlay
-          style={{
-            ...FLOATING_OVERLAY,
-            top: 76,
-            left: "50%",
-            transform: "translateX(-50%)",
-            zIndex: 15,
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "flex-start",
-            gap: 6,
-            background: data ? "rgba(0,0,0,0.82)" : "rgba(0,0,0,0.92)",
-            borderRadius: 6,
-            padding: "8px 14px",
-            fontSize: 14,
-          }}
-        >
+      {/* Snapshot selector + scene graph summary. Always visible: the
+          data-root picker must remain reachable even when the current root
+          has no snapshots (e.g. right after switching to an empty root). */}
+      <div
+        data-overlay
+        style={{
+          ...FLOATING_OVERLAY,
+          top: 76,
+          left: "50%",
+          transform: "translateX(-50%)",
+          zIndex: 15,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "flex-start",
+          gap: 6,
+          background: data ? "rgba(0,0,0,0.82)" : "rgba(0,0,0,0.92)",
+          borderRadius: 6,
+          padding: "8px 14px",
+          fontSize: 14,
+        }}
+      >
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span>Snapshot:</span>
+            {snapshots.length > 0 ? (
             <select
               value={snapshot || ""}
               onChange={(e) => handleSwitchSnapshot(e.target.value)}
@@ -2374,7 +2438,53 @@ export function SceneGraphMode() {
                 </option>
               ))}
             </select>
+            ) : (
+              <span style={{ color: "#e55", fontSize: 13 }}>无快照</span>
+            )}
           </div>
+          {/* Data-root picker: switch the server-side SceneGraph data root
+              (default: sibling scenegraph_editor repo). */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontSize: 12, color: "#999" }}>数据根:</span>
+            <input
+              value={sgRootInput}
+              onChange={(e) => setSgRootInput(e.target.value)}
+              placeholder={sgRoot}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void applySgRoot();
+              }}
+              style={{
+                flex: 1,
+                background: "#1a1a2e",
+                color: "#ddd",
+                border: "1px solid #555",
+                borderRadius: 4,
+                padding: "2px 6px",
+                fontFamily: "monospace",
+                fontSize: 11,
+                minWidth: 200,
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => void applySgRoot()}
+              style={{
+                background: "#1a1a2e",
+                color: "#3498db",
+                border: "1px solid #3498db",
+                borderRadius: 4,
+                cursor: "pointer",
+                fontFamily: "monospace",
+                fontSize: 11,
+                padding: "2px 8px",
+              }}
+            >
+              切换
+            </button>
+          </div>
+          {sgRootError && (
+            <div style={{ color: "#e55", fontSize: 11 }}>{sgRootError}</div>
+          )}
           {data && (
             <div
               style={{
@@ -2398,7 +2508,6 @@ export function SceneGraphMode() {
             </div>
           )}
         </div>
-      )}
 
       {editMode === "edit" && (
         <div

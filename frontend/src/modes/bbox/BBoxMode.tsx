@@ -15,11 +15,19 @@ import {
 } from "./lib/bbox";
 import { loadPcd, loadPly } from "../../shared/pcd-loader";
 import { PointCloudLayer } from "../../shared/components/PointCloudLayer";
+import {
+  GaussianSplatLayer,
+  disposeSplatCache,
+} from "../../shared/components/GaussianSplatLayer";
+import type { DropInViewer } from "@mkkellogg/gaussian-splats-3d";
 import { BBoxLayer } from "./components/BBoxLayer";
 import { BBoxPanel } from "./components/BBoxPanel";
 import { CameraControls } from "./components/CameraControls";
-import { GaussianSplatViewer } from "./components/GaussianSplatViewer";
-import { detectCloudFormat, type CloudAssetFormat } from "../../shared/splat-format";
+import {
+  detectCloudFormat,
+  type CloudAssetFormat,
+  type SplatFormat,
+} from "../../shared/splat-format";
 import { createLocalStorageHook } from "../../shared/use-local-storage";
 import { useCloudFiles } from "../../shared/use-cloud-files";
 import { isUndoShortcut } from "../../shared/shortcuts";
@@ -91,6 +99,7 @@ function Picker({
   sceneGroupRef,
   controlsRef,
   pointsRef,
+  splatViewerRef,
   dragRefs,
   anchorZRef,
   onPlace,
@@ -101,6 +110,7 @@ function Picker({
   sceneGroupRef: RefObject<THREE.Group | null>;
   controlsRef: RefObject<any>;
   pointsRef: RefObject<THREE.Points | null>;
+  splatViewerRef: RefObject<DropInViewer | null>;
   dragRefs: React.MutableRefObject<DragEntry[]>;
   anchorZRef: React.MutableRefObject<number>;
   onPlace: (p: Vec3) => void;
@@ -234,8 +244,34 @@ function Picker({
       return [local.x, local.y, local.z];
     };
 
-    // Primary pick: raycast against the point cloud; fall back to the local
-    // horizontal plane when the ray misses the cloud.
+    // Pick an exact point on the splat surface using the library's own
+    // raycaster (world-space hit → scene-local via the rotated group).
+    const splatPointAt = (clientX: number, clientY: number): Vec3 | null => {
+      const dropIn = splatViewerRef.current;
+      const viewer = dropIn?.viewer;
+      if (!viewer || !viewer.raycaster || !viewer.splatMesh) return null;
+      const sceneGroup = sceneGroupRef.current;
+      if (!sceneGroup) return null;
+
+      camera.updateMatrixWorld();
+      const rect = canvas.getBoundingClientRect();
+      viewer.raycaster.setFromCameraAndScreenPosition(
+        camera,
+        { x: clientX - rect.left, y: clientY - rect.top },
+        new THREE.Vector2(rect.width, rect.height),
+      );
+      const hits: Array<{ origin: THREE.Vector3 }> = [];
+      viewer.raycaster.intersectSplatMesh(viewer.splatMesh, hits);
+      if (hits.length === 0) return null;
+
+      sceneGroup.updateWorldMatrix(true, false);
+      const local = sceneGroup.worldToLocal(hits[0]!.origin.clone());
+      return [local.x, local.y, local.z];
+    };
+
+    // Primary pick: raycast against the point cloud (if present), then the
+    // splat surface (3DGS mode), falling back to the local horizontal plane
+    // when the ray misses both.
     const pickPoint = (clientX: number, clientY: number, anchorZLocal: number): Vec3 | null => {
       const raycaster = raycasterFrom(clientX, clientY);
       raycaster.params.Points.threshold = 0.4;
@@ -253,6 +289,9 @@ function Picker({
           return [hits[0]!.point.x, hits[0]!.point.y, hits[0]!.point.z];
         }
       }
+
+      const splat = splatPointAt(clientX, clientY);
+      if (splat) return splat;
 
       return localFromRayAtZ(clientX, clientY, anchorZLocal);
     };
@@ -379,7 +418,7 @@ function Picker({
       if (dragRef.current && controlsRef.current) controlsRef.current.enabled = true;
       dragRef.current = null;
     };
-  }, [gl, camera, sceneGroupRef, controlsRef, pointsRef, dragRefs, anchorZRef]);
+  }, [gl, camera, sceneGroupRef, controlsRef, pointsRef, splatViewerRef, dragRefs, anchorZRef]);
 
   return null;
 }
@@ -397,6 +436,11 @@ function Scene({
   placing,
   draftMin,
   anchorZRef,
+  renderMode,
+  splatSrc,
+  splatFormat,
+  onSplatLoadingChange,
+  onSplatError,
   onPlace,
   onDrag,
   onDragStart,
@@ -412,6 +456,11 @@ function Scene({
   placing: boolean;
   draftMin: Vec3 | null;
   anchorZRef: React.MutableRefObject<number>;
+  renderMode: RenderMode;
+  splatSrc: string | null;
+  splatFormat: SplatFormat;
+  onSplatLoadingChange: (loading: boolean) => void;
+  onSplatError: (message: string | null) => void;
   onPlace: (p: Vec3) => void;
   onDrag: (boxId: string, corner: number, position: Vec3) => void;
   onDragStart: (boxId: string) => void;
@@ -420,6 +469,7 @@ function Scene({
   const sceneGroupRef = useRef<THREE.Group>(null);
   const controlsRef = useRef<any>(null);
   const pointsRef = useRef<THREE.Points>(null);
+  const splatViewerRef = useRef<DropInViewer | null>(null);
   const dragRefs = useRef<DragEntry[]>([]);
 
   // While placing a new box, right-drag on empty space must not pan the camera
@@ -438,13 +488,27 @@ function Scene({
       <directionalLight position={[10, 15, 5]} intensity={1.2} />
 
       <group ref={sceneGroupRef} rotation={[-Math.PI / 2, 0, 0]}>
-        <PointCloudLayer
-          ref={pointsRef}
-          positions={positions}
-          colorHex="#aaccff"
-          pointSize={pointSize}
-          opacity={0.85}
-        />
+        {renderMode === "pointcloud" && (
+          <PointCloudLayer
+            ref={pointsRef}
+            positions={positions}
+            colorHex="#aaccff"
+            pointSize={pointSize}
+            opacity={0.85}
+          />
+        )}
+
+        {renderMode === "3dgs" && splatSrc && (
+          <GaussianSplatLayer
+            src={splatSrc}
+            format={splatFormat}
+            onViewer={(v) => {
+              splatViewerRef.current = v;
+            }}
+            onLoadingChange={onSplatLoadingChange}
+            onError={onSplatError}
+          />
+        )}
 
         {boxes.map((box, i) => (
           <BBoxLayer
@@ -475,6 +539,7 @@ function Scene({
         sceneGroupRef={sceneGroupRef}
         controlsRef={controlsRef}
         pointsRef={pointsRef}
+        splatViewerRef={splatViewerRef}
         dragRefs={dragRefs}
         anchorZRef={anchorZRef}
         onPlace={onPlace}
@@ -504,7 +569,9 @@ export function BBoxMode() {
   // Every format the tool can render: .pcd renders as a point cloud, .ply in
   // both modes, and .splat/.ksplat/.spz as 3DGS (the render-mode effect
   // switches automatically). Matches the backend whitelist.
-  const allCloudFiles = useCloudFiles("/api/pointcloud-files");
+  const { files: allCloudFiles, reload: reloadCloudFiles } = useCloudFiles(
+    "/api/pointcloud-files",
+  );
   const cloudFiles = useMemo(
     () => allCloudFiles.filter((n) => detectCloudFormat(n) !== null),
     [allCloudFiles],
@@ -513,6 +580,11 @@ export function BBoxMode() {
   const [renderMode, setRenderMode] = useState<RenderMode>("pointcloud");
   const [imported, setImported] = useState<{ name: string; url: string; format: AssetFormat } | null>(null);
   const importedUrlRef = useRef<string | null>(null);
+  const [splatLoading, setSplatLoading] = useState(false);
+  const [splatError, setSplatError] = useState<string | null>(null);
+
+  // Free the module-level splat viewer (GPU textures) when leaving this mode.
+  useEffect(() => () => disposeSplatCache(), []);
 
   // The asset currently being edited: a locally imported file (not persisted
   // to localStorage) or the server-side cloud selected in the dropdown.
@@ -995,6 +1067,7 @@ export function BBoxMode() {
         copied={copied}
         cloudFiles={cloudFiles}
         selectedCloud={activeName}
+        onCloudRootChanged={reloadCloudFiles}
         renderMode={renderMode}
         onRenderMode={setRenderMode}
         onImportFile={handleImportFile}
@@ -1051,58 +1124,80 @@ export function BBoxMode() {
         </div>
       )}
 
-      {renderMode === "3dgs" ? (
-        canRender3dgs ? (
-          <GaussianSplatViewer
-            src={activeAssetUrl}
-            format={activeAssetFormat as "ply" | "splat" | "ksplat" | "spz"}
-            boxes={boxes}
-            activeId={activeId}
-            placing={placing}
-            draftMin={draftMin}
-            handleRadius={handleRadius}
-            lineWidth={lineWidth}
-            opacity={opacity}
-            anchorZRef={anchorZRef}
-            onPlace={handlePlace}
-            onDrag={handleDrag}
-            onDragStart={handleDragStart}
-            onSelectBox={handleSelectBox}
-          />
-        ) : (
-          <div
-            style={{
-              position: "absolute",
-              top: "50%",
-              left: "50%",
-              transform: "translate(-50%,-50%)",
-              color: "#888",
-              fontFamily: "monospace",
-              fontSize: 14,
-              pointerEvents: "none",
-            }}
-          >
-            当前文件（.{activeAssetFormat}）不支持 3DGS 渲染，请选择 .ply / .splat / .ksplat / .spz 文件
-          </div>
-        )
-      ) : (
-        <Scene
-          positions={positions}
-          pointSize={pointSize}
-          handleRadius={handleRadius}
-          lineWidth={lineWidth}
-          opacity={opacity}
-          boxes={boxes}
-          activeId={activeId}
-          placing={placing}
-          draftMin={draftMin}
-          anchorZRef={anchorZRef}
-          onPlace={handlePlace}
-          onDrag={handleDrag}
-          onDragStart={handleDragStart}
-          onSelectBox={handleSelectBox}
-        />
+      {renderMode === "3dgs" && canRender3dgs && splatLoading && (
+        <div
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            transform: "translate(-50%,-50%)",
+            color: "#666",
+            fontFamily: "monospace",
+            fontSize: 14,
+            pointerEvents: "none",
+          }}
+        >
+          Loading 3DGS…
+        </div>
       )}
+
+      {renderMode === "3dgs" && canRender3dgs && splatError && (
+        <div
+          style={{
+            position: "absolute",
+            top: 48,
+            left: 16,
+            zIndex: 20,
+            background: "rgba(200,0,0,0.85)",
+            color: "#fff",
+            padding: "8px 16px",
+            borderRadius: 6,
+            fontSize: 13,
+            fontFamily: "monospace",
+          }}
+        >
+          {splatError}
+        </div>
+      )}
+
+      {renderMode === "3dgs" && !canRender3dgs && (
+        <div
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            transform: "translate(-50%,-50%)",
+            color: "#888",
+            fontFamily: "monospace",
+            fontSize: 14,
+            pointerEvents: "none",
+          }}
+        >
+          当前文件（.{activeAssetFormat}）不支持 3DGS 渲染，请选择 .ply / .splat / .ksplat / .spz 文件
+        </div>
+      )}
+
+      <Scene
+        positions={positions}
+        pointSize={pointSize}
+        handleRadius={handleRadius}
+        lineWidth={lineWidth}
+        opacity={opacity}
+        boxes={boxes}
+        activeId={activeId}
+        placing={placing}
+        draftMin={draftMin}
+        anchorZRef={anchorZRef}
+        renderMode={renderMode}
+        splatSrc={renderMode === "3dgs" && canRender3dgs ? activeAssetUrl : null}
+        splatFormat={activeAssetFormat as SplatFormat}
+        onSplatLoadingChange={setSplatLoading}
+        onSplatError={setSplatError}
+        onPlace={handlePlace}
+        onDrag={handleDrag}
+        onDragStart={handleDragStart}
+        onSelectBox={handleSelectBox}
+      />
     </div>
   );
 }
