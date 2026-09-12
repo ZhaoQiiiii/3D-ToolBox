@@ -2,29 +2,29 @@
  * Vite plugin that adds every HTTP endpoint used by 3D-BBox-Tool (dual mode).
  *
  * ── BBox annotation mode ──────────────────────────────────────────────
- * - GET  /api/pointcloud-files     → list cloud/splat files under pcd/
- * - GET  /api/pcd?name=elec.ply    → stream a scene asset from pcd/
+ * - GET  /api/pointcloud-files     → list cloud/splat files under scenes/
+ * - GET  /api/pcd?name=elec.ply    → stream a scene asset from scenes/
  * - GET  /api/bbox?name=elec.ply   → load saved labelled boxes for an asset
  * - POST /api/bbox                 → persist labelled boxes (per-asset + legacy)
  *
  * ── SceneGraph edit mode ──────────────────────────────────────────────
- * Snapshot data lives in the scenegraph_editor repo by default; override the
- * location with the SG_ROOT environment variable (absolute or relative path).
+ * Snapshot data lives in the bundled scene_graph/ directory:
  * scene_graph_saved/ is read-only source data; exports always go to
  * scene_graph_exported/ under the same root.
  *
  * - GET  /api/scene-pcds                   → alias of /api/pointcloud-files
  * - GET  /api/pcd?snapshot=X&path=objects/… → per-object cloud (exported/ first)
- * - GET  /api/pcd?source=scene&name=X      → scene asset from the shared pcd/
+ * - GET  /api/pcd?source=scene&name=X      → scene asset from scenes/
  * - GET  /api/snapshot | /api/snapshots    → latest / all snapshots
  * - GET  /api/scene-graph                   → scene_graph.json (exported/ first)
  * - POST /api/export                        → apply mutations, write exported/
  * - POST /api/log                           → client-side event sink
  *
  * ── Trajectory visualization mode ────────────────────────────────────
- * The user supplies an arbitrary server path to a worldmodel
- * flight_…/step_… directory. Everything is strictly read-only; only
- * whitelisted well-known artifact names can be read out of a step dir.
+ * Browsing is fixed to trajectories/ (TRAJ_ROOT): the UI walks worldmodel
+ * flight_…/step_… directories under it. Everything is strictly read-only;
+ * only whitelisted well-known artifact names can be read out of a step dir,
+ * and every requested path must stay inside TRAJ_ROOT.
  *
  * - GET  /api/traj-browse?path=…  → smart listing (step/flight/dir levels)
  * - GET  /api/traj-file?path=…&name=…    → whitelisted step JSON artifacts
@@ -49,7 +49,7 @@ import {
   rmSync,
 } from "node:fs";
 import { copyFile, mkdir } from "node:fs/promises";
-import { join, dirname, resolve, basename, isAbsolute } from "node:path";
+import { join, dirname, resolve, basename, isAbsolute, sep } from "node:path";
 import type {
   MovePoly,
   EdgeRef,
@@ -103,26 +103,6 @@ function readJson(path: string): any {
   return JSON.parse(readFileSync(path, "utf-8"));
 }
 
-/**
- * Load the persisted runtime-switchable data roots (`.runtime-state.json`
- * next to the backend). Written whenever the UI switches the cloud or
- * SceneGraph data root, so a dev-server restart keeps the user's paths.
- * Returns empty fields when the file is missing or unreadable.
- */
-function loadRuntimeState(): { pcdRoot?: string; sgRoot?: string } {
-  try {
-    const j = readJson(
-      join(import.meta.dirname, "..", ".runtime-state.json"),
-    );
-    return {
-      pcdRoot: typeof j?.pcdRoot === "string" ? j.pcdRoot : undefined,
-      sgRoot: typeof j?.sgRoot === "string" ? j.sgRoot : undefined,
-    };
-  } catch {
-    return {};
-  }
-}
-
 function writeJson(path: string, data: any): void {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(data, null, 2) + "\n");
@@ -131,7 +111,7 @@ function writeJson(path: string, data: any): void {
 /**
  * A file name is a single directory component (no separators, no "..").
  * Names flow directly into path joins, so reject anything that could
- * escape the pcd/ or snapshot directories.
+ * escape the scenes/ or snapshot directories.
  */
 function isValidFileName(name: unknown): name is string {
   return (
@@ -151,7 +131,7 @@ function isValidSnapshotName(name: unknown): name is string {
 /**
  * Whitelist for cloud/splat asset file names served by /api/pcd. Restricting
  * to known point-cloud / gaussian-splat extensions prevents arbitrary files
- * in pcd/ (e.g. .env, .json) from being read through the endpoint.
+ * in scenes/ (e.g. .env, .json) from being read through the endpoint.
  */
 const CLOUD_FILE_RE = /\.(pcd|ply|splat|ksplat|spz)$/i;
 
@@ -189,13 +169,21 @@ const TRAJ_ASSET_TYPES: Record<string, string> = {
 };
 
 /**
- * Validate a user-supplied trajectory directory path: must be absolute and
- * free of NUL bytes. `..` components are harmless here (the user picks real
- * server paths and the file NAME is whitelisted), but NUL would corrupt the
- * underlying syscalls.
+ * Validate a trajectory directory path: must be absolute, free of NUL bytes
+ * and — after resolving `..` — inside the fixed TRAJ_ROOT. Browsing anywhere
+ * else on the server is rejected.
  */
-function isValidTrajDirPath(p: unknown): p is string {
-  return typeof p === "string" && p.length > 0 && !p.includes("\0") && isAbsolute(p);
+function trajPathWithin(root: string, p: unknown): p is string {
+  if (
+    typeof p !== "string" ||
+    p.length === 0 ||
+    p.includes("\0") ||
+    !isAbsolute(p)
+  ) {
+    return false;
+  }
+  const r = resolve(p);
+  return r === root || r.startsWith(root + sep);
 }
 
 /** Step availability info for browse listings. */
@@ -1232,33 +1220,19 @@ function logToFile(scope: string, event: string, detail?: unknown): void {
 export function apiPlugin(): Plugin {
   const PROJECT_ROOT = join(import.meta.dirname, "..");
   const BBOX_DIR = join(PROJECT_ROOT, "bboxes");
-  // Runtime-switchable cloud/splat data root (the ?name= / ?source=scene
-  // lookups and the file listing all read from it). Initialization order:
-  // persisted runtime state (last used in the UI) > PCD_ROOT env var > the
-  // bundled pcd/ directory.
-  const runtimeState = loadRuntimeState();
-  let PCD_ROOT = resolve(
-    runtimeState.pcdRoot || process.env.PCD_ROOT || join(PROJECT_ROOT, "pcd"),
-  );
+  // Fixed cloud/splat data root: only the bundled scenes/ directory is ever
+  // served (the ?name= / ?source=scene lookups and the file listing all read
+  // from it). Runtime path switching was removed on purpose — every asset the
+  // tool visualizes lives in its designated folder under the project.
+  const SCENE_ROOT = join(PROJECT_ROOT, "scenes");
 
-  // SceneGraph snapshot data root (scene_graph_saved/ + scene_graph_exported/
-  // live there). Defaults to the sibling scenegraph_editor repo; override
-  // with SG_ROOT at startup (e.g. to relocate the data or run standalone),
-  // or at RUNTIME through POST /api/sg-root (the UI's data-root picker).
-  let SG_ROOT = resolve(
-    runtimeState.sgRoot || process.env.SG_ROOT || join(PROJECT_ROOT, "..", "scenegraph_editor"),
-  );
+  // Fixed trajectory browsing root: worldmodel flight_/step_ directories are
+  // only ever read from inside trajectories/.
+  const TRAJ_ROOT = join(PROJECT_ROOT, "trajectories");
 
-  function persistRuntimeState() {
-    try {
-      writeFileSync(
-        join(PROJECT_ROOT, ".runtime-state.json"),
-        JSON.stringify({ pcdRoot: PCD_ROOT, sgRoot: SG_ROOT }, null, 2) + "\n",
-      );
-    } catch {
-      // Non-fatal: the roots stay effective for this server run.
-    }
-  }
+  // Fixed SceneGraph snapshot data root: scene_graph_saved/ (read-only
+  // source) + scene_graph_exported/ (exports) live under scene_graph/.
+  const SG_ROOT = join(PROJECT_ROOT, "scene_graph");
 
   // Initialize the log directory on plugin setup. Each `bun run dev` restart
   // gets its own timestamped file: logs/YYYY-MM-DD_HH-MM-SS.log
@@ -1272,16 +1246,16 @@ export function apiPlugin(): Plugin {
     configureServer(server: ViteDevServer) {
       // ---- BBox mode: list + serve scene assets, persist boxes ----
 
-      // List cloud/splat files in the shared pcd/ directory. Consumers filter
-      // for themselves (the BBox dropdown keeps .pcd/.ply, the SceneGraph
-      // splat picker accepts every cloud format). Registered under both the
-      // BBox and the SceneGraph legacy path.
+      // List cloud/splat files in the bundled scenes/ directory. Consumers
+      // filter for themselves (the BBox dropdown keeps .pcd/.ply, the
+      // SceneGraph splat picker accepts every cloud format). Registered
+      // under both the BBox and the SceneGraph legacy path.
       const listCloudFiles = async (
         _req: IncomingMessage,
         res: ServerResponse,
       ) => {
         try {
-          const files = readdirSync(PCD_ROOT)
+          const files = readdirSync(SCENE_ROOT)
             .filter((f) => isCloudFileName(f))
             .map((f) => ({ name: f }));
           sendJson(res, 200, { files });
@@ -1292,70 +1266,13 @@ export function apiPlugin(): Plugin {
       server.middlewares.use("/api/pointcloud-files", listCloudFiles);
       server.middlewares.use("/api/scene-pcds", listCloudFiles);
 
-      // Get / switch the cloud/splat data root at runtime (shared by the
-      // BBox, SceneGraph scene base and Trajectory scene file listings).
-      // POST body: { path: "<absolute server path>" }. Any readable
-      // directory is accepted; an empty one simply lists no files.
-      server.middlewares.use(
-        "/api/pcd-root",
-        async (req: IncomingMessage, res: ServerResponse) => {
-          try {
-            if (req.method === "GET") {
-              sendJson(res, 200, { root: PCD_ROOT });
-              return;
-            }
-            if (req.method !== "POST") {
-              sendJson(res, 405, { success: false, error: "Method not allowed" });
-              return;
-            }
-            // readBody enforces the shared MAX_BODY_BYTES cap (the raw
-            // req.on("data") accumulation it replaced was unbounded).
-            const body = await readBody(req);
-            try {
-              const parsed = JSON.parse(body || "{}") as { path?: unknown };
-              const path = parsed.path;
-              if (
-                typeof path !== "string" ||
-                path.length === 0 ||
-                path.includes("\0") ||
-                !isAbsolute(path)
-              ) {
-                sendJson(res, 400, {
-                  success: false,
-                  error: "Invalid path (must be absolute)",
-                });
-                return;
-              }
-              const root = resolve(path);
-              let st;
-              try {
-                st = statSync(root);
-              } catch {
-                sendJson(res, 404, { success: false, error: "Path not found" });
-                return;
-              }
-              if (!st.isDirectory()) {
-                sendJson(res, 400, { success: false, error: "Path is not a directory" });
-                return;
-              }
-              PCD_ROOT = root;
-              persistRuntimeState();
-              sendJson(res, 200, { success: true, root: PCD_ROOT });
-            } catch (err: any) {
-              sendJson(res, 500, { success: false, error: err.message });
-            }
-          } catch (err: any) {
-            sendJson(res, 500, { success: false, error: err.message });
-          }
-        },
-      );
-
       // Unified cloud/splat file endpoint, shared by both modes.
       //
       // SceneGraph-mode requests always carry `snapshot` or `source`:
       //   ?snapshot=X&path=objects/object_N_cloud.pcd  (exported/ first)
       //   ?source=scene&name=elec.ply
-      // A plain ?name=… belongs to the BBox mode and reads the shared pcd/.
+      // A plain ?name=… belongs to the BBox mode and reads the bundled
+      // scenes/ directory.
       server.middlewares.use(
         "/api/pcd",
         async (req: IncomingMessage, res: ServerResponse) => {
@@ -1387,7 +1304,7 @@ export function apiPlugin(): Plugin {
                   sendJson(res, 400, { success: false, error: "Invalid name" });
                   return;
                 }
-                filePath = join(PCD_ROOT, name);
+                filePath = join(SCENE_ROOT, name);
               } else {
                 const relPath = url.searchParams.get("path");
                 if (
@@ -1422,7 +1339,7 @@ export function apiPlugin(): Plugin {
                 sendJson(res, 400, { success: false, error: "Invalid name" });
                 return;
               }
-              filePath = join(PCD_ROOT, name);
+              filePath = join(SCENE_ROOT, name);
             }
 
             streamFile(res, filePath);
@@ -1647,71 +1564,6 @@ export function apiPlugin(): Plugin {
         },
       );
 
-      // Get / switch the SceneGraph data root at runtime (UI path picker).
-      // POST body: { path: "<absolute server path>" }. The directory must
-      // contain a scene_graph_saved/ subdir with snapshots, otherwise 400.
-      server.middlewares.use(
-        "/api/sg-root",
-        async (req: IncomingMessage, res: ServerResponse) => {
-          try {
-            if (req.method === "GET") {
-              sendJson(res, 200, { root: SG_ROOT });
-              return;
-            }
-            if (req.method !== "POST") {
-              sendJson(res, 405, { success: false, error: "Method not allowed" });
-              return;
-            }
-            // readBody enforces the shared MAX_BODY_BYTES cap (the raw
-            // req.on("data") accumulation it replaced was unbounded).
-            const body = await readBody(req);
-            try {
-              const parsed = JSON.parse(body || "{}") as { path?: unknown };
-              const path = parsed.path;
-              if (
-                typeof path !== "string" ||
-                path.length === 0 ||
-                path.includes("\0") ||
-                !isAbsolute(path)
-              ) {
-                sendJson(res, 400, {
-                  success: false,
-                  error: "Invalid path (must be absolute)",
-                });
-                return;
-              }
-              const root = resolve(path);
-              let st;
-              try {
-                st = statSync(root);
-              } catch {
-                sendJson(res, 404, { success: false, error: "Path not found" });
-                return;
-              }
-              if (!st.isDirectory()) {
-                sendJson(res, 400, { success: false, error: "Path is not a directory" });
-                return;
-              }
-              try {
-                statSync(join(root, "scene_graph_saved"));
-              } catch {
-                sendJson(res, 400, {
-                  success: false,
-                  error: "所选路径下没有 scene_graph_saved/ 目录",
-                });
-                return;
-              }
-              SG_ROOT = root;
-              sendJson(res, 200, { success: true, root: SG_ROOT });
-            } catch (err: any) {
-              sendJson(res, 500, { success: false, error: err.message });
-            }
-          } catch (err: any) {
-            sendJson(res, 500, { success: false, error: err.message });
-          }
-        },
-      );
-
       // List all available snapshots from scene_graph_saved/
       server.middlewares.use(
         "/api/snapshots",
@@ -1834,11 +1686,12 @@ export function apiPlugin(): Plugin {
               req.url || "",
               `http://${req.headers.host || "localhost"}`,
             );
-            const raw = url.searchParams.get("path");
-            if (!isValidTrajDirPath(raw)) {
+            // No `path` param → the fixed root (the UI starts there).
+            const raw = url.searchParams.get("path") ?? TRAJ_ROOT;
+            if (!trajPathWithin(TRAJ_ROOT, raw)) {
               sendJson(res, 400, {
                 success: false,
-                error: "Missing/invalid absolute path",
+                error: "Path must stay inside the project directory",
               });
               return;
             }
@@ -1856,7 +1709,7 @@ export function apiPlugin(): Plugin {
 
             const base = basename(raw);
             if (base.startsWith("step_")) {
-              sendJson(res, 200, { kind: "step", path: raw, step: trajStepInfo(raw) });
+              sendJson(res, 200, { kind: "step", path: raw, root: TRAJ_ROOT, step: trajStepInfo(raw) });
               return;
             }
 
@@ -1871,6 +1724,7 @@ export function apiPlugin(): Plugin {
               sendJson(res, 200, {
                 kind: "flight",
                 path: raw,
+                root: TRAJ_ROOT,
                 steps: entries
                   .filter((n) => n.startsWith("step_"))
                   .map((n) => trajStepInfo(join(raw, n))),
@@ -1880,6 +1734,7 @@ export function apiPlugin(): Plugin {
             sendJson(res, 200, {
               kind: "dir",
               path: raw,
+              root: TRAJ_ROOT,
               flights: entries
                 .filter((n) => n.startsWith("flight_"))
                 .map((n) => ({ name: n, path: join(raw, n) })),
@@ -1907,7 +1762,7 @@ export function apiPlugin(): Plugin {
             );
             const dir = url.searchParams.get("path");
             const name = url.searchParams.get("name");
-            if (!isValidTrajDirPath(dir) || !name || !TRAJ_JSON_FILES.has(name)) {
+            if (!trajPathWithin(TRAJ_ROOT, dir) || !name || !TRAJ_JSON_FILES.has(name)) {
               sendJson(res, 400, { success: false, error: "Invalid path or file name" });
               return;
             }
@@ -1945,7 +1800,7 @@ export function apiPlugin(): Plugin {
             const dir = url.searchParams.get("path");
             const name = url.searchParams.get("name");
             const contentType = name ? TRAJ_ASSET_TYPES[name] : undefined;
-            if (!isValidTrajDirPath(dir) || !contentType) {
+            if (!trajPathWithin(TRAJ_ROOT, dir) || !contentType) {
               sendJson(res, 400, { success: false, error: "Invalid path or asset name" });
               return;
             }

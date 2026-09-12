@@ -1,55 +1,55 @@
 import type { CSSProperties } from "react";
 import type { TrajBrowseResult, TrajStep } from "../lib/traj-types";
-import { CloudRootPicker } from "../../../shared/components/CloudRootPicker";
 
 const PANEL: CSSProperties = {
-  position: "absolute",
-  top: 16,
-  left: 16,
-  zIndex: 20,
-  width: 300,
-  maxHeight: "calc(100% - 96px)",
-  overflowY: "auto",
-  background: "rgba(0,0,0,0.82)",
+  width: "100%",
+  boxSizing: "border-box",
+  background: "rgba(10,12,24,0.88)",
   color: "#ccc",
   fontFamily: "monospace",
-  fontSize: 12,
-  border: "1px solid rgba(52,152,219,0.28)",
-  boxShadow: "0 6px 24px rgba(0,0,0,0.45)",
-  borderRadius: 6,
-  padding: "10px 12px",
+  fontSize: 13,
+  border: "1px solid rgba(52,152,219,0.35)",
+  boxShadow: "0 8px 28px rgba(0,0,0,0.5)",
+  backdropFilter: "blur(8px)",
+  WebkitBackdropFilter: "blur(8px)",
+  borderRadius: 8,
+  padding: "12px 14px",
   userSelect: "none",
+  flexShrink: 0,
 };
 
 const SECTION_TITLE: CSSProperties = {
   color: "#fff",
   fontWeight: 600,
-  fontSize: 13,
-  margin: "8px 0 6px",
+  fontSize: 14,
+  margin: "10px 0 6px",
+  letterSpacing: 0.5,
 };
 
 const inputStyle: CSSProperties = {
   flex: 1,
   height: 26,
-  background: "#1a1a2e",
-  color: "#eee",
-  border: "1px solid #3498db",
-  borderRadius: 4,
+  background: "#141428",
+  color: "#e0e6f0",
+  border: "1px solid #3a3a5c",
+  borderRadius: 6,
   padding: "2px 6px",
   fontFamily: "monospace",
   fontSize: 12,
   minWidth: 0,
+  outline: "none",
 };
 
 const btnStyle: CSSProperties = {
   background: "#1a1a2e",
   color: "#3498db",
   border: "1px solid #3498db",
-  borderRadius: 4,
+  borderRadius: 6,
   cursor: "pointer",
   fontFamily: "monospace",
   fontSize: 12,
   padding: "4px 10px",
+  transition: "background 0.15s",
 };
 
 const listBtnStyle: CSSProperties = {
@@ -58,7 +58,7 @@ const listBtnStyle: CSSProperties = {
   width: "100%",
   textAlign: "left",
   color: "#ccc",
-  borderColor: "#333",
+  borderColor: "#3a3a5c",
   marginBottom: 3,
   overflow: "hidden",
   textOverflow: "ellipsis",
@@ -79,9 +79,8 @@ const numInputStyle: CSSProperties = {
 };
 
 interface Props {
-  inputPath: string;
-  onInputPathChange: (v: string) => void;
-  onBrowse: () => void;
+  /** Fixed browsing root reported by the backend (project directory). */
+  rootPath: string;
   browse: TrajBrowseResult | null;
   browsing: boolean;
   browseError: string | null;
@@ -89,18 +88,6 @@ interface Props {
   onSelectStep: (s: TrajStep) => void;
   /** Re-browse another path (e.g. a flight_ entry from a dir listing). */
   onNavigate: (path: string) => void;
-  recentPaths: string[];
-
-  renderMode: "pointcloud" | "3dgs";
-  onRenderModeChange: (m: "pointcloud" | "3dgs") => void;
-  sceneOptions: string[];
-  sceneFile: string;
-  onSceneFileChange: (f: string) => void;
-  onCloudRootChanged?: () => void;
-  sceneLoading: boolean;
-  sceneError: string | null;
-  pointSize: number;
-  onPointSizeChange: (v: number) => void;
 
   offset: [number, number, number];
   yawDeg: number;
@@ -110,89 +97,29 @@ interface Props {
 }
 
 /**
- * Left-side control column: server path input + browse results, scene
- * selection (point cloud / 3DGS) and manual trajectory placement.
+ * Left-side control column: fixed-root trajectory browser and manual
+ * trajectory placement. Scene selection lives in the shared right-side
+ * SceneAssetPanel.
  */
 export function ControlPanel(p: Props) {
+  const inSubdir = !!p.browse && !!p.rootPath && p.browse.path !== p.rootPath;
   return (
     <div data-overlay style={PANEL}>
       <div style={SECTION_TITLE}>轨迹数据</div>
-      <div style={{ display: "flex", gap: 4 }}>
-        <input
-          style={inputStyle}
-          value={p.inputPath}
-          placeholder="/abs/path/to/flight_…"
-          onChange={(e) => p.onInputPathChange(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") p.onBrowse();
-          }}
-        />
-        <button style={btnStyle} onClick={p.onBrowse} disabled={p.browsing}>
-          {p.browsing ? "…" : "浏览"}
-        </button>
-      </div>
-      {p.recentPaths.length > 0 && (
-        <select
-          style={{ ...inputStyle, marginTop: 4, cursor: "pointer" }}
-          value=""
-          onChange={(e) => e.target.value && p.onNavigate(e.target.value)}
+      {/* Back button only appears while browsing a flight_/step_ subdir —
+          the root itself is fixed and needs no picker. */}
+      {inSubdir && (
+        <button
+          style={{ ...btnStyle, marginBottom: 4 }}
+          onClick={() => p.onNavigate(p.rootPath)}
+          disabled={p.browsing}
+          title="返回根目录"
         >
-          <option value="">— 最近路径 —</option>
-          {p.recentPaths.map((path) => (
-            <option key={path} value={path}>
-              {path}
-            </option>
-          ))}
-        </select>
+          ← 返回根目录
+        </button>
       )}
       {p.browseError && <div style={{ color: "#e55", marginTop: 4 }}>{p.browseError}</div>}
       <BrowseList {...p} />
-
-      <div style={{ ...SECTION_TITLE, marginTop: 12 }}>场景</div>
-      <div style={{ marginBottom: 6 }}>
-        <CloudRootPicker onRootChanged={p.onCloudRootChanged} />
-      </div>
-      <div style={{ display: "flex", gap: 4, marginBottom: 6 }}>
-        <button
-          style={p.renderMode === "pointcloud" ? { ...btnStyle, background: "#3498db", color: "#fff" } : btnStyle}
-          onClick={() => p.onRenderModeChange("pointcloud")}
-        >
-          点云
-        </button>
-        <button
-          style={p.renderMode === "3dgs" ? { ...btnStyle, background: "#3498db", color: "#fff" } : btnStyle}
-          onClick={() => p.onRenderModeChange("3dgs")}
-        >
-          3DGS
-        </button>
-      </div>
-      <select
-        style={{ ...inputStyle, cursor: "pointer" }}
-        value={p.sceneFile}
-        onChange={(e) => p.onSceneFileChange(e.target.value)}
-      >
-        {p.sceneOptions.map((f) => (
-          <option key={f} value={f}>
-            {f}
-          </option>
-        ))}
-      </select>
-      {p.renderMode === "pointcloud" && (
-        <label style={{ display: "block", marginTop: 6, color: "#999" }}>
-          点大小 {p.pointSize.toFixed(3)}
-          <input
-            type="range"
-            min={0.002}
-            max={0.1}
-            step={0.002}
-            value={p.pointSize}
-            onChange={(e) => p.onPointSizeChange(Number(e.target.value))}
-            style={{ width: "100%" }}
-          />
-        </label>
-      )}
-      {p.sceneLoading && <div style={{ color: "#888", marginTop: 4 }}>场景加载中…</div>}
-      {p.sceneError && <div style={{ color: "#e55", marginTop: 4 }}>{p.sceneError}</div>}
 
       <div style={{ ...SECTION_TITLE, marginTop: 12 }}>轨迹摆放</div>
       {!p.hasTrajectory ? (

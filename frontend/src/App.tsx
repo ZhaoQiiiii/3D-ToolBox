@@ -20,13 +20,17 @@ const TrajectoryMode = lazy(() =>
 type AppMode = "bbox" | "scenegraph" | "traj";
 
 const MODE_LABELS: Array<{ id: AppMode; label: string }> = [
-  { id: "bbox", label: "3D-BBox 标注" },
-  { id: "scenegraph", label: "SceneGraph 编辑" },
-  { id: "traj", label: "Trajectory 可视化" },
+  { id: "bbox", label: "3D-BBox Annotator" },
+  { id: "scenegraph", label: "SceneGraph Editor" },
+  { id: "traj", label: "3D-Trajectory Viewer" },
 ];
 
 function loadStoredMode(): AppMode {
   try {
+    // A `#mode=bbox|scenegraph|traj` hash deep-links straight into a mode
+    // (also handy for screenshots/sharing); it wins over the stored choice.
+    const h = new URLSearchParams(window.location.hash.slice(1)).get("mode");
+    if (h === "bbox" || h === "scenegraph" || h === "traj") return h;
     const v = localStorage.getItem("3dbbox_appMode");
     if (v === "bbox" || v === "scenegraph" || v === "traj") return v;
   } catch {}
@@ -75,7 +79,7 @@ export function App() {
   );
 }
 
-// Styled to match the dark floating panels used inside both modes.
+// Styled to match the dark floating panels used inside all three modes.
 const switcherStyle: CSSProperties = {
   position: "absolute",
   top: 16,
@@ -84,28 +88,34 @@ const switcherStyle: CSSProperties = {
   display: "flex",
   gap: 4,
   padding: 4,
-  borderRadius: 6,
-  background: "rgba(0,0,0,0.82)",
-  border: "1px solid rgba(52,152,219,0.28)",
-  boxShadow: "0 6px 24px rgba(0,0,0,0.45)",
+  borderRadius: 8,
+  background: "rgba(10,12,24,0.88)",
+  border: "1px solid rgba(52,152,219,0.35)",
+  boxShadow: "0 8px 28px rgba(0,0,0,0.5)",
+  backdropFilter: "blur(8px)",
+  WebkitBackdropFilter: "blur(8px)",
   userSelect: "none",
 };
 
 const btnStyle: CSSProperties = {
-  padding: "6px 12px",
-  borderRadius: 4,
-  border: "none",
+  padding: "6px 14px",
+  borderRadius: 6,
+  border: "1px solid transparent",
   background: "transparent",
-  color: "#999",
+  color: "#8ab4d8",
   fontFamily: "monospace",
-  fontSize: 13,
+  fontSize: 12,
+  letterSpacing: 0.3,
   cursor: "pointer",
+  transition: "background 0.15s, color 0.15s, border-color 0.15s",
 };
 
 const activeBtnStyle: CSSProperties = {
   ...btnStyle,
-  background: "#3498db",
+  background: "rgba(52,152,219,0.22)",
+  borderColor: "#3498db",
   color: "#fff",
+  fontWeight: 600,
 };
 
 const fallbackStyle: CSSProperties = {

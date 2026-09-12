@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { BBoxItem, Vec3 } from "../lib/bbox";
 import { colorForIndex } from "../lib/bbox";
-import { CloudRootPicker } from "../../../shared/components/CloudRootPicker";
 
 const SLIDER_RANGES: Record<"x" | "y" | "z", [number, number]> = {
   x: [-30.0, 50.0],
@@ -27,12 +26,6 @@ const rangeStyleCompact: React.CSSProperties = {
   height: 4,
 };
 
-const labelStyle: React.CSSProperties = {
-  width: 64,
-  color: "#888",
-  flexShrink: 0,
-};
-
 interface Props {
   boxes: BBoxItem[];
   activeId: string | null;
@@ -41,29 +34,14 @@ interface Props {
   cornerMax: Vec3 | null;
   center: Vec3 | null;
   size: Vec3 | null;
-  pointSize: number;
-  handleRadius: number;
-  lineWidth: number;
-  opacity: number;
   saveState: "idle" | "saving" | "saved" | "error";
   copied: boolean;
-  cloudFiles: string[];
-  selectedCloud: string;
-  onCloudRootChanged?: () => void;
-  renderMode: "pointcloud" | "3dgs";
-  onRenderMode: (mode: "pointcloud" | "3dgs") => void;
-  onImportFile: (file: File) => void;
-  onSelectCloud: (name: string) => void;
   onSetMin: (v: Vec3) => void;
   onSetMax: (v: Vec3) => void;
   onBeginEdit: () => void;
   onReset: () => void;
   onSave: () => void;
   onCopy: () => void;
-  onPointSize: (v: number) => void;
-  onHandleRadius: (v: number) => void;
-  onLineWidth: (v: number) => void;
-  onOpacity: (v: number) => void;
   onNewBox: () => void;
   onSelectBox: (id: string) => void;
   onRename: (id: string, label: string) => void;
@@ -71,19 +49,19 @@ interface Props {
 }
 
 const PANEL_STYLE: React.CSSProperties = {
-  position: "absolute",
-  top: 16,
-  left: 16,
-  zIndex: 10,
-  background: "rgba(0,0,0,0.82)",
+  background: "rgba(10,12,24,0.88)",
   color: "#ccc",
   fontFamily: "monospace",
   borderRadius: 8,
-  padding: "14px 16px",
-  width: 540,
-  maxHeight: "calc(100vh - 32px)",
-  overflowY: "auto",
-  fontSize: 14,
+  border: "1px solid rgba(52,152,219,0.35)",
+  boxShadow: "0 8px 28px rgba(0,0,0,0.5)",
+  backdropFilter: "blur(8px)",
+  WebkitBackdropFilter: "blur(8px)",
+  padding: "12px 14px",
+  width: "100%",
+  boxSizing: "border-box",
+  fontSize: 12,
+  flexShrink: 0,
 };
 
 function VecEditor({
@@ -249,40 +227,6 @@ function NumberStepper({
   );
 }
 
-function SizeControl({
-  label,
-  value,
-  min,
-  max,
-  step,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  onChange: (v: number) => void;
-}) {
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
-      <span style={labelStyle}>{label}</span>
-      <div style={{ flex: 1 }}>
-        <NumberStepper value={value} min={min} max={max} step={step} onChange={onChange} />
-      </div>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-        style={rangeStyle}
-      />
-    </div>
-  );
-}
-
 export function BBoxPanel({
   boxes,
   activeId,
@@ -291,150 +235,22 @@ export function BBoxPanel({
   cornerMax,
   center,
   size,
-  pointSize,
-  handleRadius,
-  lineWidth,
-  opacity,
   saveState,
   copied,
-  cloudFiles,
-  selectedCloud,
-  onCloudRootChanged,
-  renderMode,
-  onRenderMode,
-  onImportFile,
-  onSelectCloud,
   onSetMin,
   onSetMax,
   onBeginEdit,
   onReset,
   onSave,
   onCopy,
-  onPointSize,
-  onHandleRadius,
-  onLineWidth,
-  onOpacity,
   onNewBox,
   onSelectBox,
   onRename,
   onDeleteBox,
 }: Props) {
-  const cloudOptions = cloudFiles.includes(selectedCloud)
-    ? cloudFiles
-    : [selectedCloud, ...cloudFiles];
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
   return (
     <div data-overlay style={PANEL_STYLE}>
       <div style={{ color: "#fff", fontWeight: 700, fontSize: 15 }}>3D-ToolBox</div>
-
-      <div style={{ marginTop: 8 }}>
-        <div style={{ color: "#fff", fontWeight: 700, fontSize: 14, marginBottom: 6 }}>基本参数</div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-          <CloudRootPicker onRootChanged={onCloudRootChanged} />
-        </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={labelStyle}>点云文件</span>
-          <select
-            value={selectedCloud}
-            onChange={(e) => onSelectCloud(e.target.value)}
-            style={{
-              flex: 1,
-              background: "#1a1a2e",
-              color: "#ddd",
-              border: "1px solid #555",
-              borderRadius: 4,
-              padding: "4px 6px",
-              fontFamily: "monospace",
-              fontSize: 13,
-            }}
-          >
-            {cloudOptions.map((name) => (
-              <option key={name} value={name}>
-                {name}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
-          <span style={labelStyle}>渲染模式</span>
-          <select
-            value={renderMode}
-            onChange={(e) => onRenderMode(e.target.value as "pointcloud" | "3dgs")}
-            style={{
-              flex: 1,
-              background: "#1a1a2e",
-              color: "#ddd",
-              border: "1px solid #555",
-              borderRadius: 4,
-              padding: "4px 6px",
-              fontFamily: "monospace",
-              fontSize: 13,
-            }}
-          >
-            <option value="pointcloud">Point Cloud</option>
-            <option value="3dgs">Gaussian Splatting</option>
-          </select>
-        </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
-          <span style={labelStyle}>本地导入</span>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".ply,.pcd,.splat,.ksplat,.spz"
-            style={{ display: "none" }}
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) onImportFile(file);
-              e.target.value = "";
-            }}
-          />
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            style={importBtnStyle}
-          >
-            选择文件…
-          </button>
-        </div>
-
-        <SizeControl
-          label="点云大小"
-          value={pointSize}
-          min={0.01}
-          max={0.3}
-          step={0.01}
-          onChange={onPointSize}
-        />
-        <SizeControl
-          label="角点大小"
-          value={handleRadius}
-          min={0.02}
-          max={0.6}
-          step={0.01}
-          onChange={onHandleRadius}
-        />
-        <SizeControl
-          label="线条粗细"
-          value={lineWidth}
-          min={0.01}
-          max={0.2}
-          step={0.01}
-          onChange={onLineWidth}
-        />
-        <SizeControl
-          label="不透明度"
-          value={opacity}
-          min={0}
-          max={1}
-          step={0.01}
-          onChange={onOpacity}
-        />
-      </div>
 
       <div style={{ marginTop: 12, borderTop: "1px solid #333", paddingTop: 8 }}>
         <div style={{ color: "#fff", fontWeight: 700, fontSize: 14, marginBottom: 6 }}>
@@ -514,25 +330,21 @@ export function BBoxPanel({
 
       <div style={{ marginTop: 12, borderTop: "1px solid #333", paddingTop: 8 }}>
         {cornerMin && cornerMax && (
-          <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <VecEditor
-                label="corner_min"
-                value={cornerMin}
-                onChange={onSetMin}
-                onBeginEdit={onBeginEdit}
-                compact
-              />
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <VecEditor
-                label="corner_max"
-                value={cornerMax}
-                onChange={onSetMax}
-                onBeginEdit={onBeginEdit}
-                compact
-              />
-            </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <VecEditor
+              label="corner_min"
+              value={cornerMin}
+              onChange={onSetMin}
+              onBeginEdit={onBeginEdit}
+              compact
+            />
+            <VecEditor
+              label="corner_max"
+              value={cornerMax}
+              onChange={onSetMax}
+              onBeginEdit={onBeginEdit}
+              compact
+            />
           </div>
         )}
 
@@ -591,18 +403,6 @@ const valueRowStyle: React.CSSProperties = {
 };
 
 const btnStyle: React.CSSProperties = {
-  flex: 1,
-  background: "#1a1a2e",
-  color: "#ddd",
-  border: "1px solid #555",
-  borderRadius: 4,
-  padding: "4px 0",
-  cursor: "pointer",
-  fontFamily: "monospace",
-  fontSize: 12,
-};
-
-const importBtnStyle: React.CSSProperties = {
   flex: 1,
   background: "#1a1a2e",
   color: "#ddd",

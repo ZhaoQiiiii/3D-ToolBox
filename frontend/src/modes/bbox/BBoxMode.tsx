@@ -15,19 +15,25 @@ import {
 } from "./lib/bbox";
 import { loadPcd, loadPly } from "../../shared/pcd-loader";
 import { PointCloudLayer } from "../../shared/components/PointCloudLayer";
-import {
-  GaussianSplatLayer,
-  disposeSplatCache,
-} from "../../shared/components/GaussianSplatLayer";
+import { GaussianSplatLayer } from "../../shared/components/GaussianSplatLayer";
 import type { DropInViewer } from "@mkkellogg/gaussian-splats-3d";
 import { BBoxLayer } from "./components/BBoxLayer";
 import { BBoxPanel } from "./components/BBoxPanel";
 import { CameraControls } from "./components/CameraControls";
 import {
   detectCloudFormat,
+  splatFormatOf,
   type CloudAssetFormat,
   type SplatFormat,
 } from "../../shared/splat-format";
+import {
+  MODE_PANEL_STYLE,
+  MODE_PANEL_TITLE,
+  PanelSlider,
+  SCENE_COLUMN_STYLE,
+  TOOLS_COLUMN_STYLE,
+  SceneAssetPanel,
+} from "../../shared/components/SceneAssetPanel";
 import { createLocalStorageHook } from "../../shared/use-local-storage";
 import { useCloudFiles } from "../../shared/use-cloud-files";
 import { isUndoShortcut } from "../../shared/shortcuts";
@@ -557,6 +563,20 @@ function Scene({
 // "3dbbox_" key prefix must stay byte-identical or saved settings reset).
 const useLocalStorageState = createLocalStorageHook("3dbbox_");
 
+// Local-import button inside the right-side scene panel.
+const importBtnStyle: React.CSSProperties = {
+  width: "100%",
+  background: "#1a1a2e",
+  color: "#ddd",
+  border: "1px solid #555",
+  borderRadius: 4,
+  padding: "4px 0",
+  cursor: "pointer",
+  fontFamily: "monospace",
+  fontSize: 12,
+  marginBottom: 6,
+};
+
 export function BBoxMode() {
   const [positions, setPositions] = useState<Float32Array | null>(null);
   const [loading, setLoading] = useState(true);
@@ -569,22 +589,29 @@ export function BBoxMode() {
   // Every format the tool can render: .pcd renders as a point cloud, .ply in
   // both modes, and .splat/.ksplat/.spz as 3DGS (the render-mode effect
   // switches automatically). Matches the backend whitelist.
-  const { files: allCloudFiles, reload: reloadCloudFiles } = useCloudFiles(
-    "/api/pointcloud-files",
+  const { files: allCloudFiles } = useCloudFiles("/api/pointcloud-files");
+  // Split the shared listing for the unified right-side scene panel: files
+  // renderable as a point cloud (.pcd/.ply) vs. splat-capable assets.
+  const cloudFileList = useMemo(
+    () =>
+      allCloudFiles.filter((n) => {
+        const f = detectCloudFormat(n);
+        return f === "pcd" || f === "ply";
+      }),
+    [allCloudFiles],
   );
-  const cloudFiles = useMemo(
-    () => allCloudFiles.filter((n) => detectCloudFormat(n) !== null),
+  const splatFileList = useMemo(
+    () => allCloudFiles.filter((n) => splatFormatOf(n) !== null),
     [allCloudFiles],
   );
   const [selectedCloud, setSelectedCloud] = useLocalStorageState<string>("selectedCloud", "elec.ply");
   const [renderMode, setRenderMode] = useState<RenderMode>("pointcloud");
   const [imported, setImported] = useState<{ name: string; url: string; format: AssetFormat } | null>(null);
   const importedUrlRef = useRef<string | null>(null);
+  // Hidden <input type="file"> behind the right panel's local-import button.
+  const importInputRef = useRef<HTMLInputElement>(null);
   const [splatLoading, setSplatLoading] = useState(false);
   const [splatError, setSplatError] = useState<string | null>(null);
-
-  // Free the module-level splat viewer (GPU textures) when leaving this mode.
-  useEffect(() => () => disposeSplatCache(), []);
 
   // The asset currently being edited: a locally imported file (not persisted
   // to localStorage) or the server-side cloud selected in the dropdown.
@@ -675,10 +702,10 @@ export function BBoxMode() {
   useEffect(() => {
     // A stale persisted selection (file since deleted / never existed)
     // would 404 on load; fall back to the first available cloud.
-    if (cloudFiles.length > 0 && !cloudFiles.includes(selectedCloudRef.current)) {
-      setSelectedCloud(cloudFiles[0]!);
+    if (allCloudFiles.length > 0 && !allCloudFiles.includes(selectedCloudRef.current)) {
+      setSelectedCloud(allCloudFiles[0]!);
     }
-  }, [cloudFiles, setSelectedCloud]);
+  }, [allCloudFiles, setSelectedCloud]);
 
   useEffect(() => {
     return () => {
@@ -1003,6 +1030,19 @@ export function BBoxMode() {
     [enqueueSave],
   );
 
+  // Render-mode switch from the unified right-side scene panel. A .pcd asset
+  // cannot render as splats (the auto-revert effect would bounce straight
+  // back to Point Cloud), so switch to the first splat-capable file instead.
+  const handleRenderMode = useCallback(
+    (m: RenderMode) => {
+      if (m === "3dgs" && activeAssetFormat === "pcd" && splatFileList.length > 0) {
+        handleSelectCloud(splatFileList[0]!);
+      }
+      setRenderMode(m);
+    },
+    [activeAssetFormat, splatFileList, handleSelectCloud],
+  );
+
   const handleCopy = useCallback(async () => {
     if (!json) return;
     try {
@@ -1051,42 +1091,112 @@ export function BBoxMode() {
 
   return (
     <div style={{ width: "100%", height: "100%", position: "relative" }}>
-      <BBoxPanel
-        boxes={boxes}
-        activeId={activeId}
-        placing={placing}
-        cornerMin={activeBox?.min ?? null}
-        cornerMax={activeBox?.max ?? null}
-        center={center}
-        size={size}
-        pointSize={pointSize}
-        handleRadius={handleRadius}
-        lineWidth={lineWidth}
-        opacity={opacity}
-        saveState={saveState}
-        copied={copied}
-        cloudFiles={cloudFiles}
-        selectedCloud={activeName}
-        onCloudRootChanged={reloadCloudFiles}
-        renderMode={renderMode}
-        onRenderMode={setRenderMode}
-        onImportFile={handleImportFile}
-        onSelectCloud={handleSelectCloud}
-        onSetMin={handleSetMin}
-        onSetMax={handleSetMax}
-        onBeginEdit={beginPanelEdit}
-        onReset={handleReset}
-        onSave={handleSave}
-        onCopy={handleCopy}
-        onPointSize={setPointSize}
-        onHandleRadius={setHandleRadius}
-        onLineWidth={setLineWidth}
-        onOpacity={setOpacity}
-        onNewBox={handleNewBox}
-        onSelectBox={handleSelectBox}
-        onRename={handleRename}
-        onDeleteBox={handleDelete}
-      />
+      {/* Unified left-side scene panel shared by all three modes: render
+          mode and the cloud/splat file list, with this mode's
+          visualization parameters in a standalone panel below it. */}
+      <div style={SCENE_COLUMN_STYLE}>
+        <SceneAssetPanel
+          renderMode={renderMode}
+          onRenderModeChange={handleRenderMode}
+          cloudFiles={cloudFileList}
+          selectedCloud={activeName}
+          onSelectCloud={handleSelectCloud}
+          splatFiles={splatFileList}
+          selectedSplat={activeName}
+          onSelectSplat={(name) => {
+            if (name !== null) handleSelectCloud(name);
+          }}
+          loading={renderMode === "pointcloud" ? loading : splatLoading}
+          error={renderMode === "pointcloud" ? error : splatError}
+        >
+          <input
+            ref={importInputRef}
+            type="file"
+            accept=".ply,.pcd,.splat,.ksplat,.spz"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) handleImportFile(file);
+              e.target.value = "";
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => importInputRef.current?.click()}
+            style={importBtnStyle}
+          >
+            本地导入文件…
+          </button>
+        </SceneAssetPanel>
+
+        {/* Mode visualization panel — standalone list below the scene
+            panel (column gap in between): the annotation display
+            parameters. */}
+        <div style={MODE_PANEL_STYLE}>
+          <div style={MODE_PANEL_TITLE}>
+            <span style={{ color: "#3498db" }}>◈</span> BBox
+          </div>
+          {renderMode === "pointcloud" && (
+            <PanelSlider
+              label="点云大小"
+              value={pointSize}
+              min={0.01}
+              max={0.3}
+              step={0.01}
+              onChange={setPointSize}
+            />
+          )}
+          <PanelSlider
+            label="角点大小"
+            value={handleRadius}
+            min={0.02}
+            max={0.6}
+            step={0.01}
+            onChange={setHandleRadius}
+          />
+          <PanelSlider
+            label="线条粗细"
+            value={lineWidth}
+            min={0.01}
+            max={0.2}
+            step={0.01}
+            onChange={setLineWidth}
+          />
+          <PanelSlider
+            label="不透明度"
+            value={opacity}
+            min={0}
+            max={1}
+            step={0.01}
+            onChange={setOpacity}
+          />
+        </div>
+      </div>
+
+      {/* Mode tools on the right: the bounding-box list and editors. */}
+      <div style={TOOLS_COLUMN_STYLE}>
+        <BBoxPanel
+          boxes={boxes}
+          activeId={activeId}
+          placing={placing}
+          cornerMin={activeBox?.min ?? null}
+          cornerMax={activeBox?.max ?? null}
+          center={center}
+          size={size}
+          saveState={saveState}
+          copied={copied}
+          onSetMin={handleSetMin}
+          onSetMax={handleSetMax}
+          onBeginEdit={beginPanelEdit}
+          onReset={handleReset}
+          onSave={handleSave}
+          onCopy={handleCopy}
+          onNewBox={handleNewBox}
+          onSelectBox={handleSelectBox}
+          onRename={handleRename}
+          onDeleteBox={handleDelete}
+        />
+      </div>
 
       {renderMode === "pointcloud" && loading && (
         <div

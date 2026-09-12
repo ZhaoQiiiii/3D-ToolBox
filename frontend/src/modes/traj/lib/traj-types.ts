@@ -23,6 +23,8 @@ export interface TrajStep {
 export interface TrajBrowseResult {
   kind: "step" | "flight" | "dir";
   path: string;
+  /** The fixed browsing root (project directory) reported by the backend. */
+  root: string;
   /** kind === "step" */
   step?: TrajStep;
   /** kind === "flight" | "dir" */

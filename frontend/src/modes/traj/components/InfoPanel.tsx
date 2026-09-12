@@ -1,23 +1,21 @@
 import type { CSSProperties, RefObject } from "react";
 import type { PromptInfo, ResultInfo, TrajPoint, TrajStep } from "../lib/traj-types";
 
+// Static panel: lives inside the shared left-side scene column (below the
+// SceneAssetPanel), so it carries no absolute positioning of its own.
 const PANEL: CSSProperties = {
-  position: "absolute",
-  top: 64,
-  right: 16,
-  zIndex: 20,
-  width: 320,
-  maxHeight: "calc(100% - 140px)",
-  overflowY: "auto",
-  background: "rgba(0,0,0,0.82)",
+  background: "rgba(10,12,24,0.88)",
   color: "#ccc",
   fontFamily: "monospace",
   fontSize: 12,
-  border: "1px solid rgba(52,152,219,0.28)",
-  boxShadow: "0 6px 24px rgba(0,0,0,0.45)",
-  borderRadius: 6,
-  padding: "10px 12px",
+  border: "1px solid rgba(52,152,219,0.35)",
+  boxShadow: "0 8px 28px rgba(0,0,0,0.5)",
+  backdropFilter: "blur(8px)",
+  WebkitBackdropFilter: "blur(8px)",
+  borderRadius: 8,
+  padding: "12px 14px",
   userSelect: "none",
+  flexShrink: 0,
 };
 
 const ROW: CSSProperties = {

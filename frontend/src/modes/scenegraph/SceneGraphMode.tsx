@@ -20,13 +20,20 @@ import { ObjectsListPanel } from "./components/ObjectsListPanel";
 import { AddNodePanel } from "./components/AddNodePanel";
 import { AddObjectPanel } from "./components/AddObjectPanel";
 import { PointCloudLayer, type PcdColorScheme, SCHEME_LABELS } from "../../shared/components/PointCloudLayer";
-import { GaussianSplatLayer, disposeSplatCache } from "../../shared/components/GaussianSplatLayer";
-import { CloudRootPicker } from "../../shared/components/CloudRootPicker";
-import { splatFormatOf, type SplatFormat } from "../../shared/splat-format";
+import { GaussianSplatLayer } from "../../shared/components/GaussianSplatLayer";
+import {
+  MODE_PANEL_STYLE,
+  MODE_PANEL_TITLE,
+  PanelSlider,
+  SCENE_COLUMN_STYLE,
+  TOOLS_COLUMN_STYLE,
+  SceneAssetPanel,
+} from "../../shared/components/SceneAssetPanel";
+import { detectCloudFormat, splatFormatOf, type SplatFormat } from "../../shared/splat-format";
 import { createLocalStorageHook } from "../../shared/use-local-storage";
 import { useCloudFiles } from "../../shared/use-cloud-files";
 import { loadSceneGraph } from "./lib/scene-loader";
-import { loadPcd } from "../../shared/pcd-loader";
+import { loadPcd, loadPly } from "../../shared/pcd-loader";
 import { logEvent } from "./lib/logger";
 import { pickTarget } from "./lib/picking";
 import type { PickTarget, PickKind } from "./lib/picking";
@@ -99,49 +106,26 @@ type LayerKey = keyof Layers;
 // very large files (e.g. elec.pcd has 6,559,828 points).
 const SCENE_PCD_MAX_POINTS = 2_000_000;
 
-// Per-object clouds are usually smaller, but cap them too so "All Objects"
-// cannot OOM the tab when many large clouds are loaded at once.
-const OBJECT_PCD_MAX_POINTS = 200_000;
-
-// Load all object clouds with bounded concurrency instead of Promise.all, so a
-// single huge cloud doesn't spawn every fetch/parse at the same time.
-async function loadObjectsWithLimit<T>(
-  items: T[],
-  limit: number,
-  worker: (item: T) => Promise<any>,
-): Promise<any[]> {
-  const results: any[] = new Array(items.length);
-  let next = 0;
-  const runners = Array.from(
-    { length: Math.min(limit, items.length) },
-    async () => {
-      while (next < items.length) {
-        const i = next++;
-        try {
-          results[i] = await worker(items[i]);
-        } catch (e) {
-          results[i] = null;
-        }
-      }
-    },
-  );
-  await Promise.all(runners);
-  return results;
+/** Pick the point-cloud parser matching the file extension (.pcd / .ply). */
+function loadCloudByName(url: string, name: string, maxPoints: number) {
+  return name.toLowerCase().endsWith(".pcd")
+    ? loadPcd(url, maxPoints)
+    : loadPly(url, maxPoints);
 }
 
 // Shared overlay chrome. Most floating panels share the same dark background,
 // text colour and monospace font; individual panels only override what differs
 // (position, radius, padding, size).
 const DARK_PANEL: CSSProperties = {
-  background: "rgba(0,0,0,0.82)",
+  background: "rgba(10,12,24,0.88)",
   color: "#ccc",
   fontFamily: "monospace",
   // Subtle accent border + soft shadow give the floating panels a more
   // polished, "designed" feel without changing the dark/blue theme.
-  border: "1px solid rgba(52,152,219,0.28)",
-  boxShadow: "0 6px 24px rgba(0,0,0,0.45)",
-  backdropFilter: "blur(6px)",
-  WebkitBackdropFilter: "blur(6px)",
+  border: "1px solid rgba(52,152,219,0.35)",
+  boxShadow: "0 8px 28px rgba(0,0,0,0.5)",
+  backdropFilter: "blur(8px)",
+  WebkitBackdropFilter: "blur(8px)",
 };
 
 const FLOATING_OVERLAY: CSSProperties = {
@@ -1311,20 +1295,9 @@ function Scene({
 const useLocalStorageState = createLocalStorageHook("sge_");
 
 export function SceneGraphMode() {
-  // Free the module-level 3DGS cache when this mode unmounts (switching to
-  // the BBox mode): that mode loads its own copy of the same scene, so
-  // keeping the cached viewer alive would hold two sets of GPU textures.
-  // Child effects (the layer's own detach cleanup) run before this one.
-  useEffect(() => () => disposeSplatCache(), []);
-
   const [data, setData] = useState<SceneData | null>(null);
   const [snapshot, setSnapshot] = useState<string>("");
   const [snapshots, setSnapshots] = useState<{ name: string; saved_at: string; summary: any }[]>([]);
-  // Data-root picker state (POST /api/sg-root switches the server-side root).
-  const [sgRoot, setSgRoot] = useState<string>("");
-  const [sgRootInput, setSgRootInput] = useState<string>("");
-  const [sgRootError, setSgRootError] = useState<string | null>(null);
-  const [rootVersion, setRootVersion] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [layers, setLayers] = useState<Layers>({
@@ -1385,15 +1358,13 @@ export function SceneGraphMode() {
     Map<number, [number, number, number]>
   >(new Map());
 
-  // PCD point cloud loading
-  // null = none, "all" = all objects, "scene:NAME" = scene PCD, number = specific object
-  const [selectedPcd, setSelectedPcd] = useState<string | null>(null);
+  // PCD point cloud loading: pointcloud render mode always shows the scene
+  // cloud file chosen in the shared scene panel.
+  const [sceneCloudFile, setSceneCloudFile] = useState("");
   const [pcdLayers, setPcdLayers] = useState<{ key: string; positions: Float32Array; colorHex: string }[]>([]);
   const [pcdLoading, setPcdLoading] = useState(false);
   // Available scene-level cloud/splat files (shared fetch hook).
-  const { files: scenePcds, reload: reloadScenePcds } = useCloudFiles(
-    "/api/scene-pcds",
-  );
+  const { files: scenePcds } = useCloudFiles("/api/scene-pcds");
   // Cache parsed scene-level clouds so export reload doesn't re-parse huge files.
   const scenePcdCacheRef = useRef(new Map<string, { positions: Float32Array; colorHex: string }>());
 
@@ -1402,15 +1373,23 @@ export function SceneGraphMode() {
   const [renderMode, setRenderMode] = useState<"pointcloud" | "3dgs">(
     "pointcloud",
   );
-  // Active gaussian-splat asset (a file name in pcd/). Not persisted: it is
+  // Active gaussian-splat asset (a file name in scenes/). Not persisted: it is
   // auto-picked from the available list, so a deleted file can never strand
   // the app on a broken selection at startup.
   const [selectedSplat, setSelectedSplat] = useState<string | null>(null);
   const [splatLoading, setSplatLoading] = useState(false);
   const [splatError, setSplatError] = useState<string | null>(null);
-  // Split the listing: .pcd stays in the point-cloud dropdown, splat formats
-  // (.ply/.splat/.ksplat/.spz) populate the 3DGS selector.
-  const pcdSceneFiles = useMemo(() => scenePcds.filter((n) => n.toLowerCase().endsWith(".pcd")), [scenePcds]);
+  // Scene clouds the point-cloud loader can parse (.pcd and .ply) — the same
+  // listing the other two modes show. .ply files additionally appear in the
+  // 3DGS list below; the render mode decides which one is used.
+  const pcdSceneFiles = useMemo(
+    () =>
+      scenePcds.filter((n) => {
+        const f = detectCloudFormat(n);
+        return f === "pcd" || f === "ply";
+      }),
+    [scenePcds],
+  );
   const splatFiles = useMemo(() => scenePcds.filter((n) => splatFormatOf(n) !== null), [scenePcds]);
 
   // Display controls
@@ -1450,6 +1429,13 @@ export function SceneGraphMode() {
     }
     setSelectedSplat((cur) => (cur && splatFiles.includes(cur) ? cur : splatFiles[0]));
   }, [splatFiles]);
+
+  // Keep the scene-cloud file selection valid as the listing changes.
+  useEffect(() => {
+    if (pcdSceneFiles.length > 0 && !pcdSceneFiles.includes(sceneCloudFile)) {
+      setSceneCloudFile(pcdSceneFiles[0]!);
+    }
+  }, [pcdSceneFiles, sceneCloudFile]);
 
   const mutations = editHistory.present;
 
@@ -1513,60 +1499,6 @@ export function SceneGraphMode() {
     });
   }, []);
 
-  // Current data root (displayed as the picker's placeholder). Re-fetched
-  // whenever rootVersion changes (i.e. after a successful switch).
-  useEffect(() => {
-    (async () => {
-      try {
-        const r = await fetch("/api/sg-root");
-        if (r.ok) {
-          const j = await r.json();
-          if (typeof j.root === "string") setSgRoot(j.root);
-        }
-      } catch {
-        /* keep whatever root we already had */
-      }
-    })();
-  }, [rootVersion]);
-
-  // Switch the server-side data root, then re-list snapshots from it.
-  const applySgRoot = useCallback(async () => {
-    const p = sgRootInput.trim();
-    if (!p) return;
-    setSgRootError(null);
-    try {
-      const r = await fetch("/api/sg-root", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: p }),
-      });
-      const j = (await r.json().catch(() => null)) as
-        | { root?: string; error?: string }
-        | null;
-      if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
-      setSgRoot(j?.root ?? p);
-      // Reset all snapshot-derived state the same way a snapshot switch does,
-      // then let Phase 1 re-run against the new root.
-      setSnapshot("");
-      setData(null);
-      setEditHistory(createHistory(emptyMutations()));
-      setSelectedNodeIds(new Set());
-      setSelectedEdgeKey(null);
-      setSelectedObjectIds(new Set());
-      setPreviewObjectPositions(new Map());
-      setPreviewNodePositions(new Map());
-      setBase("saved");
-      setError(null);
-      setSelectedPcd(null);
-      setPcdLayers([]);
-      scenePcdCacheRef.current.clear();
-      setSnapshots([]);
-      setRootVersion((v) => v + 1);
-    } catch (e) {
-      setSgRootError(e instanceof Error ? e.message : String(e));
-    }
-  }, [sgRootInput]);
-
   // Phase 1: list all snapshots
   useEffect(() => {
     (async () => {
@@ -1586,7 +1518,7 @@ export function SceneGraphMode() {
         setLoading(false);
       }
     })();
-  }, [rootVersion]);
+  }, []);
 
   // Phase 2: load scene graph for selected snapshot
   useEffect(() => {
@@ -1617,90 +1549,50 @@ export function SceneGraphMode() {
     };
   }, [snapshot]);
 
-  // Load PCD point cloud(s) when selection changes.
+  // Load the scene point cloud selected in the shared scene panel.
   // Skipped while the 3DGS renderer is active (nothing to render it into);
   // switching back to pointcloud re-runs this effect and refreshes the data.
   // Existing pcdLayers are intentionally kept so the switch back is instant.
   useEffect(() => {
     if (renderMode !== "pointcloud") return;
-    if (selectedPcd === null || !data) {
+    if (!sceneCloudFile) {
       setPcdLayers([]);
       return;
     }
 
-    // Stale-response guard: switching selections mid-load must not let the
+    // Stale-response guard: switching files mid-load must not let the
     // old (slower) fetch overwrite the new one's result.
     let cancelled = false;
 
-    if (selectedPcd === "all") {
-      // Load all object clouds with bounded concurrency and per-object caps.
-      setPcdLoading(true);
-      const objectsWithCloud = data.objects.filter((o) => o.cloudPath);
-      loadObjectsWithLimit(objectsWithCloud, 4, (obj) =>
-        loadPcd(
-          `/api/pcd?snapshot=${encodeURIComponent(snapshot)}&path=${encodeURIComponent(obj.cloudPath)}`,
-          OBJECT_PCD_MAX_POINTS,
-        )
-          .then((r) => ({ key: `obj-${obj.id}`, positions: r.positions, colorHex: obj.colorHex }))
-          .catch((e) => {
-            console.warn(`PCD load failed for object ${obj.id}:`, e);
-            return null;
-          }),
-      ).then((results) => {
+    const name = sceneCloudFile;
+    const cached = scenePcdCacheRef.current.get(name);
+    if (cached) {
+      setPcdLayers([{ key: "scene", positions: cached.positions, colorHex: cached.colorHex }]);
+      return;
+    }
+    setPcdLoading(true);
+    loadCloudByName(
+      `/api/pcd?source=scene&name=${encodeURIComponent(name)}`,
+      name,
+      SCENE_PCD_MAX_POINTS,
+    )
+      .then((r) => {
         if (cancelled) return;
-        setPcdLayers(results.filter((r): r is NonNullable<typeof r> => r !== null));
+        const layer = { key: "scene", positions: r.positions, colorHex: "#aaccff" };
+        scenePcdCacheRef.current.set(name, { positions: r.positions, colorHex: "#aaccff" });
+        setPcdLayers([layer]);
+        setPcdLoading(false);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        console.warn("Scene PCD load failed:", e);
+        setPcdLayers([]);
         setPcdLoading(false);
       });
-    } else if (selectedPcd.startsWith("scene:")) {
-      // Load scene-level PCD
-      const name = selectedPcd.slice(6);
-      const cached = scenePcdCacheRef.current.get(name);
-      if (cached) {
-        setPcdLayers([{ key: "scene", positions: cached.positions, colorHex: cached.colorHex }]);
-        return;
-      }
-      setPcdLoading(true);
-      loadPcd(`/api/pcd?source=scene&name=${encodeURIComponent(name)}`, SCENE_PCD_MAX_POINTS)
-        .then((r) => {
-          if (cancelled) return;
-          const layer = { key: "scene", positions: r.positions, colorHex: "#aaccff" };
-          scenePcdCacheRef.current.set(name, { positions: r.positions, colorHex: "#aaccff" });
-          setPcdLayers([layer]);
-          setPcdLoading(false);
-        })
-        .catch((e) => {
-          if (cancelled) return;
-          console.warn("Scene PCD load failed:", e);
-          setPcdLayers([]);
-          setPcdLoading(false);
-        });
-    } else {
-      // Load single object cloud
-      const objId = Number(selectedPcd);
-      const obj = data.objects.find((o) => o.id === objId);
-      if (!obj || !obj.cloudPath) {
-        setPcdLayers([]);
-        return;
-      }
-      const url = `/api/pcd?snapshot=${encodeURIComponent(snapshot)}&path=${encodeURIComponent(obj.cloudPath)}`;
-      setPcdLoading(true);
-      loadPcd(url, OBJECT_PCD_MAX_POINTS)
-        .then((result) => {
-          if (cancelled) return;
-          setPcdLayers([{ key: `obj-${obj.id}`, positions: result.positions, colorHex: obj.colorHex }]);
-          setPcdLoading(false);
-        })
-        .catch((e) => {
-          if (cancelled) return;
-          console.warn("PCD load failed:", e);
-          setPcdLayers([]);
-          setPcdLoading(false);
-        });
-    }
     return () => {
       cancelled = true;
     };
-  }, [renderMode, selectedPcd, snapshot, data]);
+  }, [renderMode, sceneCloudFile]);
 
   const handleSelectNode = useCallback(
     (id: number, additive: boolean) => {
@@ -2126,9 +2018,6 @@ export function SceneGraphMode() {
     setPreviewObjectPositions(new Map());
     setPreviewNodePositions(new Map());
     setBase("saved");
-    setSelectedPcd(null);
-    setPcdLayers([]);
-    scenePcdCacheRef.current.clear();
     if (snapshot) {
       try {
         setLoading(true);
@@ -2158,9 +2047,6 @@ export function SceneGraphMode() {
     setPreviewNodePositions(new Map());
     setBase("saved");
     setError(null);
-    setSelectedPcd(null);
-    setPcdLayers([]);
-    scenePcdCacheRef.current.clear();
   }, [snapshot]);
 
   // ---- export ----
@@ -2394,42 +2280,54 @@ export function SceneGraphMode() {
         </div>
       )}
 
-      {/* Snapshot selector + scene graph summary. Always visible: the
-          data-root picker must remain reachable even when the current root
-          has no snapshots (e.g. right after switching to an empty root). */}
-      <div
-        data-overlay
-        style={{
-          ...FLOATING_OVERLAY,
-          top: 76,
-          left: "50%",
-          transform: "translateX(-50%)",
-          zIndex: 15,
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "flex-start",
-          gap: 6,
-          background: data ? "rgba(0,0,0,0.82)" : "rgba(0,0,0,0.92)",
-          borderRadius: 6,
-          padding: "8px 14px",
-          fontSize: 14,
-        }}
-      >
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span>Snapshot:</span>
+      {/* Unified left-side scene column shared by all three modes: the
+          shared scene-selection panel (render mode / file),
+          then this mode's visualization panel below it as a standalone
+          panel with the column gap in between. */}
+      <div data-overlay style={SCENE_COLUMN_STYLE}>
+        {/* Shared scene-selection panel (render mode / cloud or splat
+            file) — same plain file list as the other two modes. */}
+        <SceneAssetPanel
+          renderMode={renderMode}
+          onRenderModeChange={setRenderMode}
+          cloudFiles={pcdSceneFiles}
+          selectedCloud={sceneCloudFile}
+          onSelectCloud={setSceneCloudFile}
+          splatFiles={splatFiles}
+          selectedSplat={selectedSplat}
+          onSelectSplat={setSelectedSplat}
+          loading={renderMode === "pointcloud" ? pcdLoading : splatLoading}
+          error={splatError}
+        />
+
+        {/* Mode visualization panel — a standalone list below the shared
+            scene panel (column gap in between): snapshot + data root,
+            point-cloud source, cloud appearance and the Display sliders.
+            Always visible: the pickers must remain reachable even when the
+            current root has no snapshots. */}
+        <div style={MODE_PANEL_STYLE}>
+          <div style={MODE_PANEL_TITLE}>
+            <span style={{ color: "#3498db" }}>◈</span> SceneGraph
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 8, width: "100%" }}>
+            <span style={{ color: "#8ab4d8", fontSize: 11, whiteSpace: "nowrap" }}>Snapshot:</span>
             {snapshots.length > 0 ? (
             <select
               value={snapshot || ""}
               onChange={(e) => handleSwitchSnapshot(e.target.value)}
               style={{
-                background: "#222",
-                color: "#ddd",
-                border: "1px solid #555",
-                borderRadius: 4,
-                padding: "4px 8px",
+                flex: 1,
+                minWidth: 0,
+                background: "#141428",
+                color: "#e0e6f0",
+                border: "1px solid #3a3a5c",
+                borderRadius: 6,
+                padding: "4px 6px",
                 fontFamily: "monospace",
-                fontSize: 14,
-                maxWidth: 320,
+                fontSize: 12,
+                outline: "none",
+                cursor: "pointer",
               }}
             >
               {snapshots.map((s) => (
@@ -2439,61 +2337,20 @@ export function SceneGraphMode() {
               ))}
             </select>
             ) : (
-              <span style={{ color: "#e55", fontSize: 13 }}>无快照</span>
+              <span style={{ color: "#e55", fontSize: 12 }}>无快照</span>
             )}
           </div>
-          {/* Data-root picker: switch the server-side SceneGraph data root
-              (default: sibling scenegraph_editor repo). */}
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ fontSize: 12, color: "#999" }}>数据根:</span>
-            <input
-              value={sgRootInput}
-              onChange={(e) => setSgRootInput(e.target.value)}
-              placeholder={sgRoot}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void applySgRoot();
-              }}
-              style={{
-                flex: 1,
-                background: "#1a1a2e",
-                color: "#ddd",
-                border: "1px solid #555",
-                borderRadius: 4,
-                padding: "2px 6px",
-                fontFamily: "monospace",
-                fontSize: 11,
-                minWidth: 200,
-              }}
-            />
-            <button
-              type="button"
-              onClick={() => void applySgRoot()}
-              style={{
-                background: "#1a1a2e",
-                color: "#3498db",
-                border: "1px solid #3498db",
-                borderRadius: 4,
-                cursor: "pointer",
-                fontFamily: "monospace",
-                fontSize: 11,
-                padding: "2px 8px",
-              }}
-            >
-              切换
-            </button>
-          </div>
-          {sgRootError && (
-            <div style={{ color: "#e55", fontSize: 11 }}>{sgRootError}</div>
-          )}
+
           {data && (
             <div
               style={{
                 display: "flex",
                 alignItems: "center",
                 gap: 12,
-                fontSize: 12,
-                color: "#999",
-                alignSelf: "center",
+                fontSize: 11,
+                color: "#8ab4d8",
+                justifyContent: "center",
+                marginTop: 6,
               }}
             >
               <span>
@@ -2507,25 +2364,204 @@ export function SceneGraphMode() {
               </span>
             </div>
           )}
-        </div>
 
-      {editMode === "edit" && (
-        <div
-          data-overlay
-          style={{
-            position: "absolute",
-            top: 54,
-            right: 16,
-            zIndex: 10,
-            display: "flex",
-            flexDirection: "column",
-            gap: 8,
-            width: 340,
-            maxHeight: "calc(100vh - 90px)",
-            overflowY: "auto",
-            flexShrink: 0,
-          }}
-        >
+          {renderMode === "pointcloud" && (
+            <>
+              {pcdLayers.length > 0 && !pcdLoading && (
+                <div style={{ fontSize: 11, color: "#8ab4d8", marginTop: 4 }}>
+                  {pcdLayers.reduce((s, l) => s + l.positions.length / 3, 0)} points
+                </div>
+              )}
+              <PanelSlider
+                label="Point size"
+                value={pcdPointSize}
+                min={0.01}
+                max={0.3}
+                step={0.01}
+                onChange={setPcdPointSize}
+              />
+              {/* PCD color scheme */}
+              <select
+                value={pcdColorScheme}
+                onChange={(e) => setPcdColorScheme(e.target.value as PcdColorScheme)}
+                style={{
+                  width: "100%",
+                  background: "#141428",
+                  color: "#e0e6f0",
+                  border: "1px solid #3a3a5c",
+                  borderRadius: 6,
+                  padding: "3px 6px",
+                  fontFamily: "monospace",
+                  fontSize: 12,
+                  marginTop: 6,
+                  outline: "none",
+                  cursor: "pointer",
+                }}
+              >
+                {Object.entries(SCHEME_LABELS).map(([k, v]) => (
+                  <option key={k} value={k}>{v}</option>
+                ))}
+              </select>
+            </>
+          )}
+
+          {/* Display sliders (moved out of the Layers panel). */}
+          <div style={{ margin: "10px 0 6px", borderTop: "1px solid rgba(52,152,219,0.25)" }} />
+          <div style={{ fontSize: 11, color: "#8ab4d8", marginBottom: 3, letterSpacing: 0.5 }}>
+            Display
+          </div>
+          <PanelSlider label="Node size" value={nodeSize} min={0.02} max={0.50} step={0.01} onChange={setNodeSize} />
+          <PanelSlider label="Edge thick" value={topoEdgeThickness} min={0.5} max={4.0} step={0.5} onChange={setTopoEdgeThickness} decimals={1} />
+          <PanelSlider label="Object size" value={objectSize} min={0.02} max={0.50} step={0.01} onChange={setObjectSize} />
+          <PanelSlider label="Obj line" value={objectLineThickness} min={0.01} max={0.20} step={0.005} onChange={setObjectLineThickness} decimals={3} />
+        </div>
+      </div>
+
+      {/* Right-side tools column: layer toggles and (in edit mode) the
+          object/node/area editing panels. */}
+      <div data-overlay style={TOOLS_COLUMN_STYLE}>
+        {data && (
+          <>
+            {/* Layer toggles — visible in both view and edit mode, inside the
+                right-side tools column. */}
+            <div
+              style={{
+                ...DARK_PANEL,
+                borderRadius: 8,
+                padding: "12px 14px",
+                fontSize: 12,
+                width: "100%",
+                boxSizing: "border-box",
+                flexShrink: 0,
+                userSelect: "none",
+              }}
+            >
+              <div
+                style={{
+                  color: "#fff",
+                  fontWeight: 600,
+                  marginBottom: 10,
+                  fontSize: 15,
+                  letterSpacing: 0.5,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                }}
+              >
+                <span style={{ color: "#3498db" }}>◈</span> Layers
+              </div>
+
+              <Toggle
+                label="Area Boxes"
+                k="areas"
+                layers={layers}
+                toggle={toggle}
+              />
+              <Toggle
+                label="Area Edges"
+                k="areaEdges"
+                layers={layers}
+                toggle={toggle}
+              />
+              <Toggle
+                label="Area Centers"
+                k="areaCenters"
+                layers={layers}
+                toggle={toggle}
+              />
+
+              <div style={{ margin: "6px 0 4px", borderTop: "1px solid #333" }} />
+              <div style={{ fontSize: 12, color: "#8ab4d8", marginBottom: 2 }}>
+                Polyhedra
+              </div>
+              <Toggle
+                label="Poly Points"
+                k="polyPoints"
+                layers={layers}
+                toggle={toggle}
+              />
+              <Toggle
+                label="Poly Wireframe"
+                k="polyWireframe"
+                layers={layers}
+                toggle={toggle}
+              />
+              <Toggle
+                label="Poly Mesh"
+                k="polyMesh"
+                layers={layers}
+                toggle={toggle}
+              />
+              {layers.polyMesh && (
+                <div style={{ paddingLeft: 20, marginTop: 2, marginBottom: 4 }}>
+                  <input
+                    type="range"
+                    min={1}
+                    max={100}
+                    value={Math.round(meshOpacity * 100)}
+                    onChange={(e) =>
+                      setMeshOpacity(Number(e.target.value) / 100)
+                    }
+                    style={{
+                      width: "100%",
+                      accentColor: "#3498db",
+                      height: 4,
+                      cursor: "pointer",
+                    }}
+                  />
+                  <span style={{ fontSize: 12, color: "#8ab4d8" }}>
+                    {Math.round(meshOpacity * 100)}%
+                  </span>
+                </div>
+              )}
+
+              <div style={{ margin: "6px 0 4px", borderTop: "1px solid #333" }} />
+              <div style={{ fontSize: 12, color: "#8ab4d8", marginBottom: 2 }}>
+                Topology Graph
+              </div>
+              <Toggle
+                label="Topo Nodes"
+                k="topoNodes"
+                layers={layers}
+                toggle={toggle}
+              />
+              <Toggle
+                label="Topo Edges"
+                k="topoEdges"
+                layers={layers}
+                toggle={toggle}
+              />
+              <Toggle
+                label="Objects"
+                k="objects"
+                layers={layers}
+                toggle={toggle}
+              />
+
+              {/* Display tweaks */}
+              <div style={{ margin: "6px 0 4px", borderTop: "1px solid #333" }} />
+              <div style={{ fontSize: 12, color: "#8ab4d8", marginBottom: 4 }}>
+                Selection Filter
+              </div>
+              <SelectToggle label="Nodes" kind="node" selectableKinds={selectableKinds} toggle={toggleSelectable} />
+              <SelectToggle label="Edges" kind="edge" selectableKinds={selectableKinds} toggle={toggleSelectable} />
+              <SelectToggle label="Objects" kind="object" selectableKinds={selectableKinds} toggle={toggleSelectable} />
+
+
+            </div>
+          </>
+        )}
+
+        {editMode === "edit" && (
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 10,
+              width: "100%",
+              flexShrink: 0,
+            }}
+          >
           <ObjectsListPanel
             objects={effectiveTObjects}
             selectedIds={selectedObjectIds}
@@ -2685,7 +2721,8 @@ export function SceneGraphMode() {
             }}
           />
         </div>
-      )}
+        )}
+      </div>
 
       {editMode === "edit" && showAddPanel && (
         <AddNodePanel
@@ -2792,302 +2829,6 @@ export function SceneGraphMode() {
         </div>
       )}
 
-      {data && (
-        <>
-          {/* Layer toggles — visible in both view and edit mode, always in
-              the original top-left position. */}
-          <div
-            data-overlay
-            style={{
-              ...FLOATING_OVERLAY,
-              top: 54,
-              left: 16,
-              zIndex: 10,
-              borderRadius: 8,
-              padding: "16px 20px",
-              fontSize: 14,
-              minWidth: 260,
-              maxHeight: "calc(100vh - 90px)",
-              overflowY: "auto",
-              userSelect: "none",
-            }}
-          >
-            <div
-              style={{
-                color: "#fff",
-                fontWeight: 600,
-                marginBottom: 10,
-                fontSize: 16,
-              }}
-            >
-              Layers
-            </div>
-
-            {/* Render mode: point cloud or 3DGS gaussian splatting. */}
-            <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>
-              Render Mode
-            </div>
-            <select
-              value={renderMode}
-              onChange={(e) => setRenderMode(e.target.value as "pointcloud" | "3dgs")}
-              style={{
-                width: "100%",
-                background: "#1a1a2e",
-                color: "#ddd",
-                border: "1px solid #555",
-                borderRadius: 4,
-                padding: "3px 4px",
-                fontFamily: "monospace",
-                fontSize: 13,
-                marginBottom: 8,
-              }}
-            >
-              <option value="pointcloud">Point Cloud</option>
-              <option value="3dgs" disabled={splatFiles.length === 0}>
-                Gaussian Splatting {splatFiles.length === 0 ? "(no splat files)" : ""}
-              </option>
-            </select>
-
-            {renderMode === "3dgs" && (
-              <>
-                <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>
-                  Gaussian Splat
-                </div>
-                <select
-                  value={selectedSplat ?? ""}
-                  onChange={(e) => setSelectedSplat(e.target.value || null)}
-                  style={{
-                    width: "100%",
-                    background: "#1a1a2e",
-                    color: "#ddd",
-                    border: "1px solid #555",
-                    borderRadius: 4,
-                    padding: "3px 4px",
-                    fontFamily: "monospace",
-                    fontSize: 13,
-                  }}
-                >
-                  {splatFiles.map((name) => (
-                    <option key={name} value={name}>
-                      ◆ {name}
-                    </option>
-                  ))}
-                </select>
-                {splatLoading && (
-                  <div style={{ fontSize: 12, color: "#888", marginTop: 3 }}>
-                    Loading splat…
-                  </div>
-                )}
-                {splatError && (
-                  <div
-                    style={{
-                      fontSize: 11,
-                      color: "#ff6b6b",
-                      marginTop: 3,
-                      wordBreak: "break-word",
-                    }}
-                  >
-                    {splatError}
-                  </div>
-                )}
-              </>
-            )}
-
-            <Toggle
-              label="Area Boxes"
-              k="areas"
-              layers={layers}
-              toggle={toggle}
-            />
-            <Toggle
-              label="Area Edges"
-              k="areaEdges"
-              layers={layers}
-              toggle={toggle}
-            />
-            <Toggle
-              label="Area Centers"
-              k="areaCenters"
-              layers={layers}
-              toggle={toggle}
-            />
-
-            <div style={{ margin: "6px 0 4px", borderTop: "1px solid #333" }} />
-            <div style={{ fontSize: 12, color: "#888", marginBottom: 2 }}>
-              Polyhedra
-            </div>
-            <Toggle
-              label="Poly Points"
-              k="polyPoints"
-              layers={layers}
-              toggle={toggle}
-            />
-            <Toggle
-              label="Poly Wireframe"
-              k="polyWireframe"
-              layers={layers}
-              toggle={toggle}
-            />
-            <Toggle
-              label="Poly Mesh"
-              k="polyMesh"
-              layers={layers}
-              toggle={toggle}
-            />
-            {layers.polyMesh && (
-              <div style={{ paddingLeft: 20, marginTop: 2, marginBottom: 4 }}>
-                <input
-                  type="range"
-                  min={1}
-                  max={100}
-                  value={Math.round(meshOpacity * 100)}
-                  onChange={(e) =>
-                    setMeshOpacity(Number(e.target.value) / 100)
-                  }
-                  style={{
-                    width: "100%",
-                    accentColor: "#3498db",
-                    height: 4,
-                  }}
-                />
-                <span style={{ fontSize: 12, color: "#888" }}>
-                  {Math.round(meshOpacity * 100)}%
-                </span>
-              </div>
-            )}
-
-            <div style={{ margin: "6px 0 4px", borderTop: "1px solid #333" }} />
-            <div style={{ fontSize: 12, color: "#888", marginBottom: 2 }}>
-              Topology Graph
-            </div>
-            <Toggle
-              label="Topo Nodes"
-              k="topoNodes"
-              layers={layers}
-              toggle={toggle}
-            />
-            <Toggle
-              label="Topo Edges"
-              k="topoEdges"
-              layers={layers}
-              toggle={toggle}
-            />
-            <Toggle
-              label="Objects"
-              k="objects"
-              layers={layers}
-              toggle={toggle}
-            />
-
-            {/* PCD point-cloud selector (point-cloud render mode only) */}
-            {renderMode === "pointcloud" && (
-            <>
-            <div style={{ margin: "6px 0 4px", borderTop: "1px solid #333" }} />
-            <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>
-              Point Cloud
-            </div>
-            <select
-              value={selectedPcd ?? ""}
-              onChange={(e) => {
-                const v = e.target.value;
-                setSelectedPcd(v === "" ? null : v);
-              }}
-              style={{
-                width: "100%",
-                background: "#1a1a2e",
-                color: "#ddd",
-                border: "1px solid #555",
-                borderRadius: 4,
-                padding: "3px 4px",
-                fontFamily: "monospace",
-                fontSize: 13,
-              }}
-            >
-              <option value="">None</option>
-              <optgroup label="Scene Clouds">
-                {pcdSceneFiles.map((name) => (
-                  <option key={`scene:${name}`} value={`scene:${name}`}>
-                    ◆ {name}
-                  </option>
-                ))}
-              </optgroup>
-              <optgroup label="All Objects">
-                <option value="all">★ All Objects</option>
-              </optgroup>
-              <optgroup label="Per Object">
-                {data.objects.map((o) => (
-                  <option key={o.id} value={String(o.id)}>
-                    [{o.id}] {o.label}
-                  </option>
-                ))}
-              </optgroup>
-            </select>
-            {pcdLoading && (
-              <div style={{ fontSize: 12, color: "#888", marginTop: 3 }}>
-                Loading...
-              </div>
-            )}
-            {pcdLayers.length > 0 && !pcdLoading && (
-              <>
-                <div style={{ fontSize: 12, color: "#888", marginTop: 3 }}>
-                  {pcdLayers.reduce((s, l) => s + l.positions.length / 3, 0)} points
-                </div>
-                <input
-                  type="range"
-                  min={1}
-                  max={30}
-                  value={Math.round(pcdPointSize * 100)}
-                  onChange={(e) => setPcdPointSize(Number(e.target.value) / 100)}
-                  style={{ width: "100%", accentColor: "#3498db", height: 4 }}
-                />
-              </>
-            )}
-
-            {/* PCD color scheme */}
-            <div style={{ marginTop: 6 }}>
-              <select
-                value={pcdColorScheme}
-                onChange={(e) => setPcdColorScheme(e.target.value as PcdColorScheme)}
-                style={{
-                  width: "100%",
-                  background: "#1a1a2e",
-                  color: "#ddd",
-                  border: "1px solid #555",
-                  borderRadius: 4,
-                  padding: "2px 4px",
-                  fontFamily: "monospace",
-                  fontSize: 12,
-                }}
-              >
-                {Object.entries(SCHEME_LABELS).map(([k, v]) => (
-                  <option key={k} value={k}>{v}</option>
-                ))}
-              </select>
-            </div>
-            </>
-            )}
-
-            {/* Display tweaks */}
-            <div style={{ margin: "6px 0 4px", borderTop: "1px solid #333" }} />
-            <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>
-              Selection Filter
-            </div>
-            <SelectToggle label="Nodes" kind="node" selectableKinds={selectableKinds} toggle={toggleSelectable} />
-            <SelectToggle label="Edges" kind="edge" selectableKinds={selectableKinds} toggle={toggleSelectable} />
-            <SelectToggle label="Objects" kind="object" selectableKinds={selectableKinds} toggle={toggleSelectable} />
-
-            <div style={{ margin: "6px 0 4px", borderTop: "1px solid #333" }} />
-            <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>
-              Display
-            </div>
-            <Slider label="Node size" value={nodeSize} min={0.02} max={0.50} step={0.01} onChange={setNodeSize} />
-            <Slider label="Edge thick" value={topoEdgeThickness} min={0.5} max={4.0} step={0.5} onChange={setTopoEdgeThickness} />
-            <Slider label="Object size" value={objectSize} min={0.02} max={0.50} step={0.01} onChange={setObjectSize} />
-            <Slider label="Obj line" value={objectLineThickness} min={0.01} max={0.20} step={0.005} onChange={setObjectLineThickness} />
-
-          </div>
-        </>
-      )}
 
       {data ? (
         <Scene
@@ -3395,39 +3136,6 @@ function AreaRow({
 
 // ---- Toggle & ErrorBanner ----
 
-function Slider({
-  label,
-  value,
-  min,
-  max,
-  step = 1,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  step?: number;
-  onChange: (v: number) => void;
-}) {
-  return (
-    <div style={{ marginTop: 2 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#888" }}>
-        <span>{label}</span>
-        <span>{value.toFixed(2)}</span>
-      </div>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-        style={{ width: "100%", accentColor: "#3498db", height: 4 }}
-      />
-    </div>
-  );
-}
 
 function SelectToggle({
   label,

@@ -4,7 +4,7 @@ import * as GaussianSplats3D from "@mkkellogg/gaussian-splats-3d";
 import { FORMAT_TO_SCENE_FORMAT, type SplatFormat } from "../splat-format";
 
 // ---------------------------------------------------------------------------
-// Single-instance in-page cache.
+// Per-file in-page cache.
 //
 // Loading a Gaussian splat scene (fetch + parse + GPU texture upload) is the
 // expensive part — for a ~450MB PLY it takes many seconds. The library keeps
@@ -12,10 +12,16 @@ import { FORMAT_TO_SCENE_FORMAT, type SplatFormat } from "../splat-format";
 // instance lives, and simply re-attaching a kept-alive viewer renders
 // instantly (no network, no re-parse, no texture re-upload).
 //
-// So we cache exactly ONE viewer (the currently-selected file). Unmounting a
-// layer detaches the viewer from its parent group but does NOT dispose it, so
-// toggling render mode back reuses it. Switching to a different file replaces
-// the cached entry and disposes the previous one.
+// So we cache one viewer PER FILE: unmounting a layer detaches the viewer
+// from its parent group but does NOT dispose it, and switching between splat
+// files or modes re-attaches the cached viewer instantly. Entries live for
+// the whole page session (single boot) and are only released when the page
+// is reloaded / the tab is closed.
+//
+// The cache key is the FILE NAME, not the request URL: the three modes fetch
+// the same scenes/ asset through different query shapes
+// (/api/pcd?name=X vs /api/pcd?source=scene&name=X), so keying by URL would
+// re-download the same file on every mode switch.
 // ---------------------------------------------------------------------------
 
 interface CacheEntry {
@@ -25,7 +31,21 @@ interface CacheEntry {
   ready: Promise<void>;
 }
 
-let cache: CacheEntry | null = null;
+const cache = new Map<string, CacheEntry>();
+
+/**
+ * Normalize a splat src to a per-file cache key. Scene assets always carry
+ * the file name in the `name` query param; anything else keys by full URL.
+ */
+function cacheKeyOf(src: string): string {
+  try {
+    const name = new URL(src, "http://local").searchParams.get("name");
+    if (name) return `scene:${name}`;
+  } catch {
+    /* fall through to raw src */
+  }
+  return src;
+}
 
 function createViewer(src: string, format: SplatFormat): CacheEntry {
   const viewer = new GaussianSplats3D.DropInViewer({
@@ -46,42 +66,14 @@ function createViewer(src: string, format: SplatFormat): CacheEntry {
 
 /** Get the cached viewer for `src`, creating (and caching) it if needed. */
 function getViewer(src: string, format: SplatFormat): CacheEntry {
-  if (cache && cache.src === src) {
-    return cache;
+  const key = cacheKeyOf(src);
+  const existing = cache.get(key);
+  if (existing) {
+    return existing;
   }
-  // Replacing the cache with a different file: dispose the previous viewer to
-  // free its GPU textures / workers. Only the single current entry is kept.
-  if (cache) {
-    try {
-      void cache.viewer.viewer.dispose().catch(() => undefined);
-    } catch {
-      /* teardown may throw during in-flight download; ignore */
-    }
-  }
-  cache = createViewer(src, format);
-  return cache;
-}
-
-/**
- * Dispose the module-level splat cache. Called when a mode that uses this
- * layer unmounts (mode switch): the cached viewer holds GPU textures for the
- * currently-loaded file (~450MB PLY parsed + uploaded), and other modes load
- * their own copy of the same scene — keeping both would double GPU memory.
- * Disposing here means switching back re-parses the file, which is the
- * accepted trade-off.
- */
-export function disposeSplatCache(): void {
-  if (!cache) return;
-  const entry = cache;
-  cache = null;
-  // Detach from any parent group first so a mid-flight render can't touch
-  // disposed GPU resources.
-  if (entry.viewer.parent) entry.viewer.parent.remove(entry.viewer);
-  try {
-    void entry.viewer.viewer.dispose().catch(() => undefined);
-  } catch {
-    /* teardown may throw during in-flight download; ignore */
-  }
+  const entry = createViewer(src, format);
+  cache.set(key, entry);
+  return entry;
 }
 
 /**
@@ -94,7 +86,7 @@ export function disposeSplatCache(): void {
  * self-driven RAF: sorting is driven by the host render loop through the
  * viewer's internal onBeforeRender callback mesh.
  *
- * The viewer is kept in a module-level single-instance cache (see above), so
+ * The viewer is kept in a module-level per-file cache (see above), so
  * unmounting this layer only detaches the viewer — switching back re-renders
  * instantly without re-downloading/re-parsing the scene.
  */
@@ -150,8 +142,9 @@ export function GaussianSplatLayer({
         // Evict the failed entry: otherwise re-selecting the same file hits
         // the cache and replays this same rejected promise forever, making a
         // retry (e.g. after a transient network error) impossible.
-        if (cache === entry) {
-          cache = null;
+        const key = cacheKeyOf(src);
+        if (cache.get(key) === entry) {
+          cache.delete(key);
           try {
             void entry.viewer.viewer.dispose().catch(() => undefined);
           } catch {

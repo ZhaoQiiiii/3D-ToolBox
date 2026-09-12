@@ -7,11 +7,13 @@ import * as THREE from "three";
 import { TrajectoryLine } from "./components/TrajectoryLine";
 import { ControlPanel } from "./components/ControlPanel";
 import { InfoPanel } from "./components/InfoPanel";
-import {
-  GaussianSplatLayer,
-  disposeSplatCache,
-} from "../../shared/components/GaussianSplatLayer";
+import { GaussianSplatLayer } from "../../shared/components/GaussianSplatLayer";
 import { PointCloudLayer } from "../../shared/components/PointCloudLayer";
+import {
+  PanelSlider,
+  SCENE_COLUMN_STYLE,
+  SceneAssetPanel,
+} from "../../shared/components/SceneAssetPanel";
 import { loadPcd, loadPly } from "../../shared/pcd-loader";
 import { detectCloudFormat, splatFormatOf } from "../../shared/splat-format";
 import { createLocalStorageHook } from "../../shared/use-local-storage";
@@ -71,26 +73,24 @@ const btnStyle: CSSProperties = {
 /**
  * Trajectory visualization mode.
  *
- * The user picks an arbitrary server path (worldmodel flight_/step_ dir) and
- * a render scene (point cloud or 3DGS); the pi3_local trajectory is overlaid
- * on the scene and can be dragged into place (left button = horizontal,
- * right button = vertical — same convention as the BBox corner handles).
+ * Trajectory browsing is fixed to the project directory (the backend rejects
+ * paths outside it); the UI walks worldmodel flight_/step_ directories from
+ * that root. A render scene (point cloud or 3DGS) is picked from the shared
+ * scenes/ listing and the pi3_local trajectory is overlaid on the scene and
+ * can be dragged into place (left button = horizontal, right button =
+ * vertical — same convention as the BBox corner handles).
  *
  * trajectory.json is in a per-step LOCAL frame (every step starts at its own
  * origin); nothing in the data relates it to the world frame, so placement
  * is manual by design.
  */
 export function TrajectoryMode() {
-  // ---- path browsing ----
-  const [inputPath, setInputPath] = useState("");
+  // ---- path browsing (fixed to the backend-reported root) ----
   const [browse, setBrowse] = useState<TrajBrowseResult | null>(null);
   const [browsing, setBrowsing] = useState(false);
   const [browseError, setBrowseError] = useState<string | null>(null);
   const [selectedStep, setSelectedStep] = useState<TrajStep | null>(null);
-  const [recentPaths, setRecentPaths] = useLocalStorageState<string[]>(
-    "recentPaths",
-    [],
-  );
+  const [rootPath, setRootPath] = useState("");
 
   // ---- step data ----
   const [traj, setTraj] = useState<TrajectoryData | null>(null);
@@ -100,18 +100,16 @@ export function TrajectoryMode() {
   const [result, setResult] = useState<ResultInfo | null>(null);
 
   // ---- scene ----
-  const { files: sceneFiles, reload: reloadSceneFiles } = useCloudFiles(
-    "/api/pointcloud-files",
-  );
-  const [renderMode, setRenderMode] = useLocalStorageState<RenderMode>(
-    "renderMode",
-    "pointcloud",
-  );
+  const { files: sceneFiles } = useCloudFiles("/api/pointcloud-files");
+  // Not persisted: always starts on "pointcloud" regardless of prior choice
+  // (same convention as the other two modes).
+  const [renderMode, setRenderMode] = useState<RenderMode>("pointcloud");
   const [sceneFile, setSceneFile] = useLocalStorageState("sceneFile", "elec.ply");
   const [pointSize, setPointSize] = useLocalStorageState("pointSize", 0.02);
   const [positions, setPositions] = useState<Float32Array | null>(null);
   const [sceneLoading, setSceneLoading] = useState(false);
   const [sceneError, setSceneError] = useState<string | null>(null);
+  const [splatLoading, setSplatLoading] = useState(false);
 
   // ---- placement & playback ----
   const [offset, setOffset] = useState<[number, number, number]>([0, 0, 0]);
@@ -123,74 +121,67 @@ export function TrajectoryMode() {
   // Monotonic token for browse requests (see doBrowse).
   const browseSeqRef = useRef(0);
 
-  const sceneOptions = useMemo(() => {
-    if (renderMode === "3dgs") {
-      return sceneFiles.filter((n) => splatFormatOf(n) !== null);
-    }
-    return sceneFiles.filter((n) => {
-      const f = detectCloudFormat(n);
-      return f === "pcd" || f === "ply";
-    });
-  }, [sceneFiles, renderMode]);
+  // Split the shared cloud listing for the unified right-side scene panel.
+  const cloudFileList = useMemo(
+    () =>
+      sceneFiles.filter((n) => {
+        const f = detectCloudFormat(n);
+        return f === "pcd" || f === "ply";
+      }),
+    [sceneFiles],
+  );
+  const splatFileList = useMemo(
+    () => sceneFiles.filter((n) => splatFormatOf(n) !== null),
+    [sceneFiles],
+  );
 
   // A stale persisted scene selection would 404; fall back to the first
   // available file for the active render mode.
   useEffect(() => {
-    if (sceneOptions.length > 0 && !sceneOptions.includes(sceneFile)) {
-      setSceneFile(sceneOptions[0]!);
+    const list = renderMode === "3dgs" ? splatFileList : cloudFileList;
+    if (list.length > 0 && !list.includes(sceneFile)) {
+      setSceneFile(list[0]!);
     }
-  }, [sceneOptions, sceneFile, setSceneFile]);
+  }, [renderMode, cloudFileList, splatFileList, sceneFile, setSceneFile]);
 
-  // Release the shared splat cache on unmount (mode switch) — the other
-  // modes load their own copy of the scene, keeping both would double GPU
-  // memory.
-  useEffect(() => () => disposeSplatCache(), []);
-
-  const doBrowse = useCallback(
-    async (path: string) => {
-      const trimmed = path.trim();
-      if (!trimmed) {
-        setBrowseError("请输入服务器上的绝对路径（如 worldmodel_traj 或其下的 flight_/step_ 目录）");
-        return;
+  const doBrowse = useCallback(async (path?: string) => {
+    const trimmed = path?.trim() ?? "";
+    // Sequence token: a newer browse supersedes an in-flight one, so a
+    // slow older response can never overwrite the newer listing.
+    const seq = ++browseSeqRef.current;
+    setBrowsing(true);
+    setBrowseError(null);
+    // The previous step's load error is stale once the user browses away.
+    setTrajError(null);
+    try {
+      const resp = await fetch(
+        trimmed
+          ? `/api/traj-browse?path=${encodeURIComponent(trimmed)}`
+          : "/api/traj-browse",
+      );
+      if (!resp.ok) {
+        const j = (await resp.json().catch(() => null)) as
+          | { error?: string }
+          | null;
+        throw new Error(j?.error || `HTTP ${resp.status}`);
       }
-      // Sequence token: a newer browse supersedes an in-flight one, so a
-      // slow older response can never overwrite the newer listing.
-      const seq = ++browseSeqRef.current;
-      setBrowsing(true);
-      setBrowseError(null);
-      // The previous step's load error is stale once the user browses away.
-      setTrajError(null);
-      try {
-        const resp = await fetch(
-          `/api/traj-browse?path=${encodeURIComponent(trimmed)}`,
-        );
-        if (!resp.ok) {
-          const j = (await resp.json().catch(() => null)) as
-            | { error?: string }
-            | null;
-          throw new Error(j?.error || `HTTP ${resp.status}`);
-        }
-        const data = (await resp.json()) as TrajBrowseResult;
-        if (seq !== browseSeqRef.current) return;
-        setBrowse(data);
-        setSelectedStep(null);
-        setRecentPaths((prev) =>
-          [trimmed, ...prev.filter((p) => p !== trimmed)].slice(0, 8),
-        );
-      } catch (e) {
-        if (seq !== browseSeqRef.current) return;
-        setBrowse(null);
-        setBrowseError(e instanceof Error ? e.message : String(e));
-      } finally {
-        if (seq === browseSeqRef.current) setBrowsing(false);
-      }
-    },
-    [setRecentPaths],
-  );
+      const data = (await resp.json()) as TrajBrowseResult;
+      if (seq !== browseSeqRef.current) return;
+      setBrowse(data);
+      setRootPath(data.root);
+      setSelectedStep(null);
+    } catch (e) {
+      if (seq !== browseSeqRef.current) return;
+      setBrowse(null);
+      setBrowseError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (seq === browseSeqRef.current) setBrowsing(false);
+    }
+  }, []);
 
-  // Auto-browse the most recent path on mount.
+  // Auto-browse the fixed root on mount.
   useEffect(() => {
-    if (recentPaths.length > 0) void doBrowse(recentPaths[0]!);
+    void doBrowse();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -367,58 +358,77 @@ export function TrajectoryMode() {
           yawDeg={yawDeg}
           playIndex={playIndex}
           setOffset={setOffset}
+          onSplatLoadingChange={setSplatLoading}
         />
       </Canvas>
 
-      <ControlPanel
-        inputPath={inputPath}
-        onInputPathChange={setInputPath}
-        onBrowse={() => void doBrowse(inputPath)}
-        browse={browse}
-        browsing={browsing}
-        browseError={browseError}
-        selectedStep={selectedStep}
-        onSelectStep={(s) => setSelectedStep(s)}
-        onNavigate={(path) => {
-          setInputPath(path);
-          void doBrowse(path);
-        }}
-        recentPaths={recentPaths}
-        renderMode={renderMode}
-        onRenderModeChange={setRenderMode}
-        sceneOptions={sceneOptions}
-        sceneFile={sceneFile}
-        onSceneFileChange={setSceneFile}
-        onCloudRootChanged={reloadSceneFiles}
-        sceneLoading={sceneLoading}
-        sceneError={sceneError}
-        pointSize={pointSize}
-        onPointSizeChange={setPointSize}
-        offset={offset}
-        yawDeg={yawDeg}
-        onPlacementChange={(o, y) => {
-          setOffset(o);
-          setYawDeg(y);
-        }}
-        onResetPlacement={() => {
-          setOffset([0, 0, 0]);
-          setYawDeg(0);
-        }}
-        hasTrajectory={pointCount > 0}
-      />
+      {/* Unified left-side scene column shared by all three modes: render
+          mode and cloud/splat selection on top, then this
+          mode's visualization lists (trajectory path/step browser and the
+          step info panel) as standalone panels with the column gap in
+          between. */}
+      <div style={SCENE_COLUMN_STYLE}>
+        <SceneAssetPanel
+          renderMode={renderMode}
+          onRenderModeChange={setRenderMode}
+          cloudFiles={cloudFileList}
+          selectedCloud={sceneFile}
+          onSelectCloud={setSceneFile}
+          splatFiles={splatFileList}
+          selectedSplat={sceneFile}
+          onSelectSplat={(name) => setSceneFile(name ?? "")}
+          loading={sceneLoading}
+          error={sceneError}
+        >
+          {renderMode === "pointcloud" && (
+            <PanelSlider
+              label="点大小"
+              value={pointSize}
+              min={0.002}
+              max={0.1}
+              step={0.002}
+              onChange={setPointSize}
+              decimals={3}
+            />
+          )}
+        </SceneAssetPanel>
 
-      {selectedStep && (
-        <InfoPanel
-          step={selectedStep}
-          prompt={prompt}
-          result={result}
-          hasVideo={selectedStep.hasVideo}
-          videoRef={videoRef}
-          playIndex={playIndex}
-          pointCount={pointCount}
-          currentPoint={currentPoint}
+        <ControlPanel
+          rootPath={rootPath}
+          browse={browse}
+          browsing={browsing}
+          browseError={browseError}
+          selectedStep={selectedStep}
+          onSelectStep={(s) => setSelectedStep(s)}
+          onNavigate={(path) => {
+            void doBrowse(path);
+          }}
+          offset={offset}
+          yawDeg={yawDeg}
+          onPlacementChange={(o, y) => {
+            setOffset(o);
+            setYawDeg(y);
+          }}
+          onResetPlacement={() => {
+            setOffset([0, 0, 0]);
+            setYawDeg(0);
+          }}
+          hasTrajectory={pointCount > 0}
         />
-      )}
+
+        {selectedStep && (
+          <InfoPanel
+            step={selectedStep}
+            prompt={prompt}
+            result={result}
+            hasVideo={selectedStep.hasVideo}
+            videoRef={videoRef}
+            playIndex={playIndex}
+            pointCount={pointCount}
+            currentPoint={currentPoint}
+          />
+        )}
+      </div>
 
       {pointCount > 0 && (
         <div style={HINT_BAR}>
@@ -477,16 +487,27 @@ export function TrajectoryMode() {
         </div>
       )}
 
-      <div
-        style={{
-          ...HINT_BAR,
-          bottom: 52,
-          zIndex: 19,
-          color: "#888",
-        }}
-      >
-        左键拖轨迹=水平移动 · 右键拖=垂直移动 · 轨迹为 step 局部坐标，需手动摆放
-      </div>
+      {/* Centered 3DGS loading indicator (same as the other two modes) */}
+      {renderMode === "3dgs" && splatLoading && (
+        <div
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            transform: "translate(-50%,-50%)",
+            background: "rgba(0,0,0,0.75)",
+            borderRadius: 8,
+            padding: "12px 20px",
+            color: "#fff",
+            fontSize: 14,
+            fontFamily: "monospace",
+            pointerEvents: "none",
+            zIndex: 5,
+          }}
+        >
+          正在渲染 3DGS…
+        </div>
+      )}
     </div>
   );
 }
@@ -503,6 +524,7 @@ interface TrajSceneProps {
   yawDeg: number;
   playIndex: number;
   setOffset: (o: [number, number, number]) => void;
+  onSplatLoadingChange: (loading: boolean) => void;
 }
 
 function TrajScene(p: TrajSceneProps) {
@@ -696,6 +718,7 @@ function TrajScene(p: TrajSceneProps) {
               <GaussianSplatLayer
                 src={`/api/pcd?name=${encodeURIComponent(p.sceneFile)}`}
                 format={fmt}
+                onLoadingChange={p.onSplatLoadingChange}
               />
             );
           })()}
