@@ -1,32 +1,41 @@
 import { useEffect, useRef } from "react";
+import { useThree } from "@react-three/fiber";
 import * as THREE from "three";
 import * as GaussianSplats3D from "@mkkellogg/gaussian-splats-3d";
 import { FORMAT_TO_SCENE_FORMAT, type SplatFormat } from "../splat-format";
 
 // ---------------------------------------------------------------------------
-// Per-file in-page cache.
+// Per-file, per-Canvas in-page cache.
 //
 // Loading a Gaussian splat scene (fetch + parse + GPU texture upload) is the
 // expensive part — for a ~450MB PLY it takes many seconds. The library keeps
 // the parsed buffers and uploaded textures alive as long as the DropInViewer
-// instance lives, and simply re-attaching a kept-alive viewer renders
-// instantly (no network, no re-parse, no texture re-upload).
+// instance lives, and re-attaching a kept-alive viewer to the SAME Canvas
+// renders instantly (no network, no re-parse, no texture re-upload).
 //
-// So we cache one viewer PER FILE: unmounting a layer detaches the viewer
-// from its parent group but does NOT dispose it, and switching between splat
-// files or modes re-attaches the cached viewer instantly. Entries live for
-// the whole page session (single boot) and are only released when the page
-// is reloaded / the tab is closed.
+// Viewers are, however, bound to the WebGL context of the Canvas they were
+// first rendered in: R3F force-losses the context when a Canvas unmounts,
+// so a cached viewer is DEAD GPU-wise after a mode switch (each mode owns
+// its own <Canvas>). Re-attaching a dead viewer shows nothing AND never
+// loads (its ready promise is already resolved) — so cache entries are
+// keyed by FILE and validated against the current renderer. A mismatch
+// (new Canvas) evicts the dead viewer and takes the normal load path;
+// the same renderer (render-mode toggle within one mode) re-attaches
+// instantly.
 //
-// The cache key is the FILE NAME, not the request URL: the three modes fetch
-// the same scenes/ asset through different query shapes
-// (/api/pcd?name=X vs /api/pcd?source=scene&name=X), so keying by URL would
-// re-download the same file on every mode switch.
+// The cache key is the SCENE + FILE NAME, not the request URL: the three
+// modes fetch the same scenes/<scene>/ asset through different query shapes
+// (/api/pcd?scene=X&name=Y vs /api/pcd?scene=X&source=scene&name=Y), so
+// keying by URL would re-download the same file on every mode switch; and
+// keying by file name alone would collide across scenes holding an asset
+// with the same name.
 // ---------------------------------------------------------------------------
 
 interface CacheEntry {
   src: string;
   format: SplatFormat;
+  /** The Canvas (WebGL renderer) this viewer's GPU resources live in. */
+  renderer: THREE.WebGLRenderer;
   viewer: GaussianSplats3D.DropInViewer;
   ready: Promise<void>;
 }
@@ -35,19 +44,28 @@ const cache = new Map<string, CacheEntry>();
 
 /**
  * Normalize a splat src to a per-file cache key. Scene assets always carry
- * the file name in the `name` query param; anything else keys by full URL.
+ * the file name in the `name` query param (plus the `scene` bucket); anything
+ * else keys by full URL.
  */
 function cacheKeyOf(src: string): string {
   try {
-    const name = new URL(src, "http://local").searchParams.get("name");
-    if (name) return `scene:${name}`;
+    const u = new URL(src, "http://local");
+    const name = u.searchParams.get("name");
+    if (name) {
+      const scene = u.searchParams.get("scene");
+      return scene ? `scene:${scene}/${name}` : `scene:${name}`;
+    }
   } catch {
     /* fall through to raw src */
   }
   return src;
 }
 
-function createViewer(src: string, format: SplatFormat): CacheEntry {
+function createViewer(
+  src: string,
+  format: SplatFormat,
+  renderer: THREE.WebGLRenderer,
+): CacheEntry {
   const viewer = new GaussianSplats3D.DropInViewer({
     // Avoid SharedArrayBuffer / cross-origin-isolation requirements
     // (the Vite dev server sends no COOP/COEP headers).
@@ -61,17 +79,37 @@ function createViewer(src: string, format: SplatFormat): CacheEntry {
       showLoadingUI: false,
     })
     .then(() => undefined);
-  return { src, format, viewer, ready };
+  return { src, format, renderer, viewer, ready };
 }
 
-/** Get the cached viewer for `src`, creating (and caching) it if needed. */
-function getViewer(src: string, format: SplatFormat): CacheEntry {
+/**
+ * Get the cached viewer for `src` on the CURRENT Canvas (`renderer`),
+ * creating (and caching) it if needed. A cached entry bound to a different
+ * renderer belongs to an unmounted Canvas whose WebGL context R3F has
+ * force-lossed — its GPU resources are gone, so it is disposed and replaced
+ * (the fresh viewer takes the normal load path, with loading UI).
+ */
+function getViewer(
+  src: string,
+  format: SplatFormat,
+  renderer: THREE.WebGLRenderer,
+): CacheEntry {
   const key = cacheKeyOf(src);
   const existing = cache.get(key);
   if (existing) {
-    return existing;
+    if (existing.renderer === renderer) {
+      return existing;
+    }
+    cache.delete(key);
+    try {
+      // The typings don't expose DropInViewer.dispose(); the internal
+      // viewer has the same async teardown (see the error-eviction path).
+      void existing.viewer.viewer.dispose().catch(() => undefined);
+    } catch {
+      /* teardown may throw for a dead-context viewer; ignore */
+    }
   }
-  const entry = createViewer(src, format);
+  const entry = createViewer(src, format, renderer);
   cache.set(key, entry);
   return entry;
 }
@@ -109,8 +147,11 @@ export function GaussianSplatLayer({
   onViewer?: (viewer: GaussianSplats3D.DropInViewer | null) => void;
 }) {
   const groupRef = useRef<THREE.Group>(null);
+  // The host Canvas's WebGL renderer — identity of the WebGL context the
+  // viewer's GPU resources must live in (see the cache notes above).
+  const { gl } = useThree();
   // Keep the callback in a ref: the effect below intentionally only re-runs
-  // on src/format changes, so it must always see the latest callback.
+  // on src/format/renderer changes, so it must always see the latest callback.
   const onViewerRef = useRef(onViewer);
   onViewerRef.current = onViewer;
 
@@ -121,8 +162,8 @@ export function GaussianSplatLayer({
     let disposed = false;
     let attached = false;
 
-    // Reuse (or create) the cached viewer for this file.
-    const entry = getViewer(src, format);
+    // Reuse (or create) the cached viewer for this file on this Canvas.
+    const entry = getViewer(src, format, gl);
     onViewerRef.current?.(entry.viewer);
 
     onLoadingChange?.(true);
@@ -161,7 +202,7 @@ export function GaussianSplatLayer({
       if (attached) parent.remove(entry.viewer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [src, format]);
+  }, [src, format, gl]);
 
   return <group ref={groupRef} />;
 }

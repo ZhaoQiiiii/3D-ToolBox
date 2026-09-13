@@ -1,6 +1,6 @@
 import { useEffect, useState, useMemo, useCallback, useRef } from "react";
 import type { CSSProperties, RefObject } from "react";
-import { Canvas, useThree } from "@react-three/fiber";
+import { useThree } from "@react-three/fiber";
 import { OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import * as THREE from "three";
 import { AreaBox } from "./components/AreaBoxes";
@@ -29,11 +29,11 @@ import {
   TOOLS_COLUMN_STYLE,
   SceneAssetPanel,
 } from "../../shared/components/SceneAssetPanel";
-import { detectCloudFormat, splatFormatOf, type SplatFormat } from "../../shared/splat-format";
+import { type SplatFormat } from "../../shared/splat-format";
 import { createLocalStorageHook } from "../../shared/use-local-storage";
-import { useCloudFiles } from "../../shared/use-cloud-files";
+import { useSceneAssets } from "../../shared/use-scene-assets";
+import { useCanvasSlot } from "../../shared/canvas-slot";
 import { loadSceneGraph } from "./lib/scene-loader";
-import { loadPcd, loadPly } from "../../shared/pcd-loader";
 import { logEvent } from "./lib/logger";
 import { pickTarget } from "./lib/picking";
 import type { PickTarget, PickKind } from "./lib/picking";
@@ -105,13 +105,6 @@ type LayerKey = keyof Layers;
 // Cap scene-level point clouds to avoid freezing the UI when parsing/rendering
 // very large files (e.g. elec.pcd has 6,559,828 points).
 const SCENE_PCD_MAX_POINTS = 2_000_000;
-
-/** Pick the point-cloud parser matching the file extension (.pcd / .ply). */
-function loadCloudByName(url: string, name: string, maxPoints: number) {
-  return name.toLowerCase().endsWith(".pcd")
-    ? loadPcd(url, maxPoints)
-    : loadPly(url, maxPoints);
-}
 
 // Shared overlay chrome. Most floating panels share the same dark background,
 // text colour and monospace font; individual panels only override what differs
@@ -1138,6 +1131,10 @@ function Scene({
       if (current.kind !== target.kind) return target;
       if (current.kind === "node" && target.kind === "node" && current.id === target.id) return current;
       if (current.kind === "edge" && target.kind === "edge" && current.key === target.key) return current;
+      // picking.ts returns a fresh object literal for objects on every
+      // pick, so without an id-equality branch here hovering an object
+      // would re-render the whole Scene on every rAF.
+      if (current.kind === "object" && target.kind === "object" && current.id === target.id) return current;
       return target;
     });
   }, []);
@@ -1161,8 +1158,11 @@ function Scene({
     [effectiveAreas, layers.areas, selectedArea],
   );
 
+  // Rendered into the shared persistent canvas (App level) via useCanvasSlot
+  // — the canvas (and its WebGL context / GPU resources) survives mode
+  // switches, so the splat viewer and point clouds re-attach instantly.
   return (
-    <Canvas style={{ width: "100%", height: "100%" }}>
+    <>
       <PerspectiveCamera makeDefault position={[12, 25, 20]} />
       <ambientLight intensity={0.5} />
       <directionalLight position={[10, 15, 5]} intensity={1.2} />
@@ -1284,7 +1284,7 @@ function Scene({
         objects={tObjects}
         nodeMap={nodeMap}
       />
-    </Canvas>
+    </>
   );
 }
 
@@ -1295,6 +1295,28 @@ function Scene({
 const useLocalStorageState = createLocalStorageHook("sge_");
 
 export function SceneGraphMode() {
+  // Scene-rendering state — the ONE shared implementation (scene bucket,
+  // asset listing, selections, render mode, point-cloud loading with the
+  // module-level cache) used by all three modes. SceneGraph only adds its
+  // snapshot/edit state on top of it.
+  const {
+    scenes,
+    scene,
+    selectScene,
+    cloudFiles,
+    splatFiles,
+    renderMode,
+    setRenderMode,
+    selectedCloud,
+    selectCloud,
+    selectedSplat,
+    selectSplat,
+    activeFormat,
+    activeUrl,
+    positions,
+    cloudLoading,
+    cloudError,
+  } = useSceneAssets(SCENE_PCD_MAX_POINTS);
   const [data, setData] = useState<SceneData | null>(null);
   const [snapshot, setSnapshot] = useState<string>("");
   const [snapshots, setSnapshots] = useState<{ name: string; saved_at: string; summary: any }[]>([]);
@@ -1358,39 +1380,20 @@ export function SceneGraphMode() {
     Map<number, [number, number, number]>
   >(new Map());
 
-  // PCD point cloud loading: pointcloud render mode always shows the scene
-  // cloud file chosen in the shared scene panel.
-  const [sceneCloudFile, setSceneCloudFile] = useState("");
-  const [pcdLayers, setPcdLayers] = useState<{ key: string; positions: Float32Array; colorHex: string }[]>([]);
-  const [pcdLoading, setPcdLoading] = useState(false);
-  // Available scene-level cloud/splat files (shared fetch hook).
-  const { files: scenePcds } = useCloudFiles("/api/scene-pcds");
-  // Cache parsed scene-level clouds so export reload doesn't re-parse huge files.
-  const scenePcdCacheRef = useRef(new Map<string, { positions: Float32Array; colorHex: string }>());
-
-  // Render mode (view mode only; entering edit mode forces "pointcloud").
-  // Not persisted: always starts on "pointcloud" regardless of prior choice.
-  const [renderMode, setRenderMode] = useState<"pointcloud" | "3dgs">(
-    "pointcloud",
+  // Scene-cloud layer for the canvas, derived from the shared loader's
+  // positions (stays filled while the 3DGS renderer is active so switching
+  // back is instant).
+  const pcdLayers = useMemo(
+    () =>
+      positions
+        ? [{ key: "scene", positions, colorHex: "#aaccff" }]
+        : [],
+    [positions],
   );
-  // Active gaussian-splat asset (a file name in scenes/). Not persisted: it is
-  // auto-picked from the available list, so a deleted file can never strand
-  // the app on a broken selection at startup.
-  const [selectedSplat, setSelectedSplat] = useState<string | null>(null);
+
+  // Splat renderer feedback (loading/error from the canvas layer).
   const [splatLoading, setSplatLoading] = useState(false);
   const [splatError, setSplatError] = useState<string | null>(null);
-  // Scene clouds the point-cloud loader can parse (.pcd and .ply) — the same
-  // listing the other two modes show. .ply files additionally appear in the
-  // 3DGS list below; the render mode decides which one is used.
-  const pcdSceneFiles = useMemo(
-    () =>
-      scenePcds.filter((n) => {
-        const f = detectCloudFormat(n);
-        return f === "pcd" || f === "ply";
-      }),
-    [scenePcds],
-  );
-  const splatFiles = useMemo(() => scenePcds.filter((n) => splatFormatOf(n) !== null), [scenePcds]);
 
   // Display controls
   const [nodeSize, setNodeSize] = useLocalStorageState("disp_nodeSize_v2", 0.1);
@@ -1411,31 +1414,6 @@ export function SceneGraphMode() {
       return next;
     });
   }, []);
-
-  // 3DGS fallbacks: a renderMode="3dgs" is useless (and would show an empty
-  // scene) when no splat assets exist — fall back to pointcloud. Otherwise
-  // auto-pick the first splat file once, and keep the selection valid if the
-  // underlying file disappears from the listing.
-  useEffect(() => {
-    if (renderMode === "3dgs" && scenePcds.length > 0 && splatFiles.length === 0) {
-      setRenderMode("pointcloud");
-    }
-  }, [renderMode, scenePcds, splatFiles, setRenderMode]);
-
-  useEffect(() => {
-    if (splatFiles.length === 0) {
-      setSelectedSplat(null);
-      return;
-    }
-    setSelectedSplat((cur) => (cur && splatFiles.includes(cur) ? cur : splatFiles[0]));
-  }, [splatFiles]);
-
-  // Keep the scene-cloud file selection valid as the listing changes.
-  useEffect(() => {
-    if (pcdSceneFiles.length > 0 && !pcdSceneFiles.includes(sceneCloudFile)) {
-      setSceneCloudFile(pcdSceneFiles[0]!);
-    }
-  }, [pcdSceneFiles, sceneCloudFile]);
 
   const mutations = editHistory.present;
 
@@ -1499,18 +1477,39 @@ export function SceneGraphMode() {
     });
   }, []);
 
-  // Phase 1: list all snapshots
+  // Phase 1: list all snapshots of the active scene. On a scene switch this
+  // also drops every snapshot-scoped state (same reset as
+  // handleSwitchSnapshot) so old-scene edits can never leak into an export
+  // against the new scene — even if both scenes happen to share a snapshot
+  // name. All resets are no-ops on the initial mount; the shared scene hook
+  // resets the asset selections on its side.
   useEffect(() => {
+    if (!scene) return;
+    setSnapshots([]);
+    setSnapshot("");
+    setData(null);
+    setEditHistory(createHistory(emptyMutations()));
+    setSelectedNodeIds(new Set());
+    setSelectedEdgeKey(null);
+    setSelectedObjectIds(new Set());
+    setPreviewObjectPositions(new Map());
+    setPreviewNodePositions(new Map());
+    setBase("saved");
+    setError(null);
     (async () => {
       try {
-        const resp = await fetch("/api/snapshots");
+        const resp = await fetch(
+          `/api/snapshots?scene=${encodeURIComponent(scene)}`,
+        );
         const json = await resp.json();
         const list = json.snapshots || [];
         setSnapshots(list);
         if (list.length > 0) {
           setSnapshot(list[0].name); // triggers Phase 2
         } else {
-          setError("No snapshots found");
+          // No snapshots yet: NOT an error — the scene itself (point cloud /
+          // 3DGS via the shared scene hook) still renders normally, and the
+          // user can create the first snapshot from the scene file.
           setLoading(false);
         }
       } catch (e) {
@@ -1518,18 +1517,18 @@ export function SceneGraphMode() {
         setLoading(false);
       }
     })();
-  }, []);
+  }, [scene]);
 
   // Phase 2: load scene graph for selected snapshot
   useEffect(() => {
-    if (!snapshot) return;
+    if (!snapshot || !scene) return;
     let cancelled = false;
     (async () => {
       setLoading(true);
       setError(null);
       try {
         const { data: sceneData, source } = await loadSceneGraph(
-          `/api/scene-graph?snapshot=${snapshot}`,
+          `/api/scene-graph?scene=${encodeURIComponent(scene)}&snapshot=${encodeURIComponent(snapshot)}`,
         );
         if (cancelled) return;
         setData(sceneData);
@@ -1547,52 +1546,7 @@ export function SceneGraphMode() {
     return () => {
       cancelled = true;
     };
-  }, [snapshot]);
-
-  // Load the scene point cloud selected in the shared scene panel.
-  // Skipped while the 3DGS renderer is active (nothing to render it into);
-  // switching back to pointcloud re-runs this effect and refreshes the data.
-  // Existing pcdLayers are intentionally kept so the switch back is instant.
-  useEffect(() => {
-    if (renderMode !== "pointcloud") return;
-    if (!sceneCloudFile) {
-      setPcdLayers([]);
-      return;
-    }
-
-    // Stale-response guard: switching files mid-load must not let the
-    // old (slower) fetch overwrite the new one's result.
-    let cancelled = false;
-
-    const name = sceneCloudFile;
-    const cached = scenePcdCacheRef.current.get(name);
-    if (cached) {
-      setPcdLayers([{ key: "scene", positions: cached.positions, colorHex: cached.colorHex }]);
-      return;
-    }
-    setPcdLoading(true);
-    loadCloudByName(
-      `/api/pcd?source=scene&name=${encodeURIComponent(name)}`,
-      name,
-      SCENE_PCD_MAX_POINTS,
-    )
-      .then((r) => {
-        if (cancelled) return;
-        const layer = { key: "scene", positions: r.positions, colorHex: "#aaccff" };
-        scenePcdCacheRef.current.set(name, { positions: r.positions, colorHex: "#aaccff" });
-        setPcdLayers([layer]);
-        setPcdLoading(false);
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        console.warn("Scene PCD load failed:", e);
-        setPcdLayers([]);
-        setPcdLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [renderMode, sceneCloudFile]);
+  }, [snapshot, scene]);
 
   const handleSelectNode = useCallback(
     (id: number, additive: boolean) => {
@@ -2018,20 +1972,28 @@ export function SceneGraphMode() {
     setPreviewObjectPositions(new Map());
     setPreviewNodePositions(new Map());
     setBase("saved");
-    if (snapshot) {
+    if (snapshot && scene) {
+      // Snapshot-switch competition guard (same pattern as handleExport):
+      // if the user switches snapshots while this reload is in flight, a
+      // late response must not clobber the newly-selected snapshot's data
+      // or prematurely clear its loading state.
+      const target = snapshot;
       try {
         setLoading(true);
         const { data: freshData } = await loadSceneGraph(
-          `/api/scene-graph?snapshot=${snapshot}&source=saved`,
+          `/api/scene-graph?scene=${encodeURIComponent(scene)}&snapshot=${encodeURIComponent(target)}&source=saved`,
         );
+        if (snapshotRef.current !== target) return;
         setData(freshData);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        if (snapshotRef.current === target) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
       } finally {
-        setLoading(false);
+        if (snapshotRef.current === target) setLoading(false);
       }
     }
-  }, [snapshot]);
+  }, [snapshot, scene]);
 
   // ---- snapshot switching ----
 
@@ -2055,12 +2017,13 @@ export function SceneGraphMode() {
     // Read from ref: a blur-committed inline edit may be newer than the
     // `mutations` value captured in this callback's closure.
     const currentMutations = mutationsRef.current;
-    if (mutationCount(currentMutations) === 0 || exporting || !snapshot) {
+    if (mutationCount(currentMutations) === 0 || exporting || !snapshot || !scene) {
       logEvent("export skipped", { dirty: mutationCount(currentMutations) > 0, exporting, snapshot: !!snapshot });
       return;
     }
     setExporting(true);
     logEvent("export start", {
+      scene,
       snapshot,
       base,
       counts: {
@@ -2080,7 +2043,7 @@ export function SceneGraphMode() {
       const resp = await fetch("/api/export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ snapshot, mutations: currentMutations, base }),
+        body: JSON.stringify({ scene, snapshot, mutations: currentMutations, base }),
       });
       const json: ExportResponse = await resp.json();
       if (!json.success) {
@@ -2093,7 +2056,7 @@ export function SceneGraphMode() {
       // while the export was in flight, do NOT clobber the newly-selected
       // snapshot's data with this one's reload.
       const { data: newData } = await loadSceneGraph(
-        `/api/scene-graph?snapshot=${snapshot}`,
+        `/api/scene-graph?scene=${encodeURIComponent(scene)}&snapshot=${encodeURIComponent(snapshot)}`,
       );
       if (snapshotRef.current !== snapshot) return;
       setData(newData);
@@ -2114,7 +2077,7 @@ export function SceneGraphMode() {
     } finally {
       setExporting(false);
     }
-  }, [exporting, snapshot, base]);
+  }, [exporting, snapshot, scene, base]);
 
   // ---- layer toggle ----
 
@@ -2220,8 +2183,59 @@ export function SceneGraphMode() {
   // Edit mode now honors the same user-adjustable layers as view mode.
   const renderedLayers = layers;
 
+  // 3D content → shared persistent canvas (App level). The canvas and its
+  // WebGL context survive mode switches, so the splat viewer / point clouds
+  // re-attach from cache instantly. Rendered UNCONDITIONALLY of `data`:
+  // the point cloud / 3DGS scene comes from useSceneAssets, and a scene
+  // without any snapshot yet must still render its cloud — the graph
+  // overlays simply derive to empty arrays when data is null.
+  useCanvasSlot(
+    <Scene
+      effectiveNodes={previewedTNodes}
+      effectiveEdges={effectiveTEdges}
+      effectivePolys={effectivePolys}
+      effectiveAreas={effectiveAreas}
+      effectiveObjects={previewedTObjects}
+      layers={renderedLayers}
+      selectedArea={selectedArea}
+      selectedNodeIds={selectedNodeIds}
+      selectedEdgeKey={selectedEdgeKey}
+      selectedObjectIds={selectedObjectIds}
+      editMode={editMode === "edit"}
+      onSelectNode={handleSelectNode}
+      onSelectEdge={handleSelectEdge}
+      onSelectObject={handleSelectObject}
+      onDoubleClickNode={handleDoubleClickNode}
+      onDoubleClickObject={handleDoubleClickObject}
+      onDeselectAll={handleDeselectAll}
+      meshOpacity={meshOpacity}
+      pcdLayers={pcdLayers}
+      pcdPointSize={pcdPointSize}
+      pcdColorScheme={pcdColorScheme}
+      renderMode={renderMode}
+      splatSrc={renderMode === "3dgs" ? activeUrl : null}
+      splatFormat={(activeFormat as SplatFormat | null) ?? "ply"}
+      onSplatLoadingChange={setSplatLoading}
+      onSplatError={setSplatError}
+      nodeSize={nodeSize}
+      topoEdgeThickness={topoEdgeThickness}
+      objectSize={objectSize}
+      objectLineThickness={objectLineThickness}
+      selectableKinds={selectableKinds}
+      focusRequest={focusRequest}
+      onDragPreview={handleDragPreview}
+      onDragCommit={handleDragCommit}
+      onPickPosition={
+        addMode ? (position) => setPickedPosition(position) : undefined
+      }
+    />,
+  );
+
   return (
-    <div style={{ width: "100%", height: "100%", position: "relative" }}>
+    <div
+      className="mode-overlay"
+      style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
+    >
       {error && <ErrorBanner msg={error} />}
 
       {/* Edit toolbar */}
@@ -2290,14 +2304,17 @@ export function SceneGraphMode() {
         <SceneAssetPanel
           renderMode={renderMode}
           onRenderModeChange={setRenderMode}
-          cloudFiles={pcdSceneFiles}
-          selectedCloud={sceneCloudFile}
-          onSelectCloud={setSceneCloudFile}
+          scenes={scenes}
+          selectedScene={scene}
+          onSelectScene={selectScene}
+          cloudFiles={cloudFiles}
+          selectedCloud={selectedCloud}
+          onSelectCloud={selectCloud}
           splatFiles={splatFiles}
           selectedSplat={selectedSplat}
-          onSelectSplat={setSelectedSplat}
-          loading={renderMode === "pointcloud" ? pcdLoading : splatLoading}
-          error={splatError}
+          onSelectSplat={selectSplat}
+          loading={renderMode === "pointcloud" ? cloudLoading : splatLoading}
+          error={renderMode === "pointcloud" ? cloudError : splatError}
         />
 
         {/* Mode visualization panel — a standalone list below the shared
@@ -2337,7 +2354,7 @@ export function SceneGraphMode() {
               ))}
             </select>
             ) : (
-              <span style={{ color: "#e55", fontSize: 12 }}>无快照</span>
+              <span style={{ color: "#8ab4d8", fontSize: 12 }}>无快照</span>
             )}
           </div>
 
@@ -2367,7 +2384,7 @@ export function SceneGraphMode() {
 
           {renderMode === "pointcloud" && (
             <>
-              {pcdLayers.length > 0 && !pcdLoading && (
+              {pcdLayers.length > 0 && !cloudLoading && (
                 <div style={{ fontSize: 11, color: "#8ab4d8", marginTop: 4 }}>
                   {pcdLayers.reduce((s, l) => s + l.positions.length / 3, 0)} points
                 </div>
@@ -2830,51 +2847,7 @@ export function SceneGraphMode() {
       )}
 
 
-      {data ? (
-        <Scene
-          effectiveNodes={previewedTNodes}
-          effectiveEdges={effectiveTEdges}
-          effectivePolys={effectivePolys}
-          effectiveAreas={effectiveAreas}
-          effectiveObjects={previewedTObjects}
-          layers={renderedLayers}
-          selectedArea={selectedArea}
-          selectedNodeIds={selectedNodeIds}
-          selectedEdgeKey={selectedEdgeKey}
-          selectedObjectIds={selectedObjectIds}
-          editMode={editMode === "edit"}
-          onSelectNode={handleSelectNode}
-          onSelectEdge={handleSelectEdge}
-          onSelectObject={handleSelectObject}
-          onDoubleClickNode={handleDoubleClickNode}
-          onDoubleClickObject={handleDoubleClickObject}
-          onDeselectAll={handleDeselectAll}
-          meshOpacity={meshOpacity}
-          pcdLayers={pcdLayers}
-          pcdPointSize={pcdPointSize}
-          pcdColorScheme={pcdColorScheme}
-          renderMode={renderMode}
-          splatSrc={
-            selectedSplat
-              ? `/api/pcd?source=scene&name=${encodeURIComponent(selectedSplat)}`
-              : null
-          }
-          splatFormat={selectedSplat ? (splatFormatOf(selectedSplat) ?? "ply") : "ply"}
-          onSplatLoadingChange={setSplatLoading}
-          onSplatError={setSplatError}
-          nodeSize={nodeSize}
-          topoEdgeThickness={topoEdgeThickness}
-          objectSize={objectSize}
-          objectLineThickness={objectLineThickness}
-          selectableKinds={selectableKinds}
-          focusRequest={focusRequest}
-          onDragPreview={handleDragPreview}
-          onDragCommit={handleDragCommit}
-          onPickPosition={
-            addMode ? (position) => setPickedPosition(position) : undefined
-          }
-        />
-      ) : loading ? (
+      {loading && !data && (
         <div
           style={{
             position: "absolute",
@@ -2888,7 +2861,7 @@ export function SceneGraphMode() {
         >
           Loading...
         </div>
-      ) : null}
+      )}
 
       {/* Centered 3DGS rendering indicator */}
       {renderMode === "3dgs" && splatLoading && (
@@ -2914,7 +2887,7 @@ export function SceneGraphMode() {
 
       {/* Export diff panel overlay */}
       {showDiff && snapshot && (
-        <ExportDiffPanel snapshot={snapshot} onClose={() => setShowDiff(false)} />
+        <ExportDiffPanel scene={scene} snapshot={snapshot} onClose={() => setShowDiff(false)} />
       )}
     </div>
   );

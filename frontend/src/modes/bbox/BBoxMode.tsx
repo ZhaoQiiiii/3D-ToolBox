@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
-import { Canvas, useThree } from "@react-three/fiber";
+import { useThree } from "@react-three/fiber";
 import { PerspectiveCamera } from "@react-three/drei";
 import * as THREE from "three";
 import type { BBoxItem, DragEntry, Vec3 } from "./lib/bbox";
@@ -13,19 +13,13 @@ import {
   vecMin,
   vecMax,
 } from "./lib/bbox";
-import { loadPcd, loadPly } from "../../shared/pcd-loader";
 import { PointCloudLayer } from "../../shared/components/PointCloudLayer";
 import { GaussianSplatLayer } from "../../shared/components/GaussianSplatLayer";
 import type { DropInViewer } from "@mkkellogg/gaussian-splats-3d";
 import { BBoxLayer } from "./components/BBoxLayer";
 import { BBoxPanel } from "./components/BBoxPanel";
 import { CameraControls } from "./components/CameraControls";
-import {
-  detectCloudFormat,
-  splatFormatOf,
-  type CloudAssetFormat,
-  type SplatFormat,
-} from "../../shared/splat-format";
+import { type SplatFormat } from "../../shared/splat-format";
 import {
   MODE_PANEL_STYLE,
   MODE_PANEL_TITLE,
@@ -35,7 +29,8 @@ import {
   SceneAssetPanel,
 } from "../../shared/components/SceneAssetPanel";
 import { createLocalStorageHook } from "../../shared/use-local-storage";
-import { useCloudFiles } from "../../shared/use-cloud-files";
+import { useSceneAssets } from "../../shared/use-scene-assets";
+import { useCanvasSlot } from "../../shared/canvas-slot";
 import { isUndoShortcut } from "../../shared/shortcuts";
 import {
   Y_UP,
@@ -44,10 +39,11 @@ import {
 } from "../../shared/lib/projection";
 
 // Cap the parsed cloud to keep rendering responsive (elec.pcd is ~6.5M points).
+// Annotation needs finer detail than the background-visualization modes, so
+// BBox parses at a lower budget than SceneGraph/Trajectory's 2M default.
 const PCD_MAX_POINTS = 180_000;
 
 type RenderMode = "pointcloud" | "3dgs";
-type AssetFormat = CloudAssetFormat;
 
 /** Rebuild a labelled-box list from the backend payload (new or legacy shape). */
 function parseBoxes(data: any): BBoxItem[] {
@@ -487,8 +483,11 @@ function Scene({
 
   const draftColor = colorForIndex(boxes.length);
 
+  // Rendered into the shared persistent canvas (App level) via useCanvasSlot
+  // — the canvas (and its WebGL context / GPU resources) survives mode
+  // switches, so the splat viewer and point clouds re-attach instantly.
   return (
-    <Canvas style={{ width: "100%", height: "100%" }}>
+    <>
       <PerspectiveCamera makeDefault position={[12, 25, 20]} />
       <ambientLight intensity={0.5} />
       <directionalLight position={[10, 15, 5]} intensity={1.2} />
@@ -553,7 +552,7 @@ function Scene({
         onDragStart={onDragStart}
         onSelectBox={onSelectBox}
       />
-    </Canvas>
+    </>
   );
 }
 
@@ -563,75 +562,17 @@ function Scene({
 // "3dbbox_" key prefix must stay byte-identical or saved settings reset).
 const useLocalStorageState = createLocalStorageHook("3dbbox_");
 
-// Local-import button inside the right-side scene panel.
-const importBtnStyle: React.CSSProperties = {
-  width: "100%",
-  background: "#1a1a2e",
-  color: "#ddd",
-  border: "1px solid #555",
-  borderRadius: 4,
-  padding: "4px 0",
-  cursor: "pointer",
-  fontFamily: "monospace",
-  fontSize: 12,
-  marginBottom: 6,
-};
-
 export function BBoxMode() {
-  const [positions, setPositions] = useState<Float32Array | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [pointSize, setPointSize] = useLocalStorageState<number>("pointSize", 0.06);
   const [handleRadius, setHandleRadius] = useLocalStorageState<number>("handleRadius", 0.12);
   const [lineWidth, setLineWidth] = useLocalStorageState<number>("lineWidth", 0.04);
   const [opacity, setOpacity] = useLocalStorageState<number>("opacity", 0.08);
 
-  // Every format the tool can render: .pcd renders as a point cloud, .ply in
-  // both modes, and .splat/.ksplat/.spz as 3DGS (the render-mode effect
-  // switches automatically). Matches the backend whitelist.
-  const { files: allCloudFiles } = useCloudFiles("/api/pointcloud-files");
-  // Split the shared listing for the unified right-side scene panel: files
-  // renderable as a point cloud (.pcd/.ply) vs. splat-capable assets.
-  const cloudFileList = useMemo(
-    () =>
-      allCloudFiles.filter((n) => {
-        const f = detectCloudFormat(n);
-        return f === "pcd" || f === "ply";
-      }),
-    [allCloudFiles],
-  );
-  const splatFileList = useMemo(
-    () => allCloudFiles.filter((n) => splatFormatOf(n) !== null),
-    [allCloudFiles],
-  );
-  const [selectedCloud, setSelectedCloud] = useLocalStorageState<string>("selectedCloud", "elec.ply");
-  const [renderMode, setRenderMode] = useState<RenderMode>("pointcloud");
-  const [imported, setImported] = useState<{ name: string; url: string; format: AssetFormat } | null>(null);
-  const importedUrlRef = useRef<string | null>(null);
-  // Hidden <input type="file"> behind the right panel's local-import button.
-  const importInputRef = useRef<HTMLInputElement>(null);
-  const [splatLoading, setSplatLoading] = useState(false);
-  const [splatError, setSplatError] = useState<string | null>(null);
-
-  // The asset currently being edited: a locally imported file (not persisted
-  // to localStorage) or the server-side cloud selected in the dropdown.
-  const activeName = imported?.name ?? selectedCloud;
-  const activeNameRef = useRef(activeName);
-  activeNameRef.current = activeName;
-  const selectedCloudRef = useRef(selectedCloud);
-  selectedCloudRef.current = selectedCloud;
-
-  const activeAssetFormat: AssetFormat =
-    imported?.format ?? detectCloudFormat(selectedCloud) ?? "ply";
-  const activeAssetUrl = imported
-    ? imported.url
-    : `/api/pcd?name=${encodeURIComponent(selectedCloud)}`;
-  const canRender3dgs =
-    activeAssetFormat === "ply" ||
-    activeAssetFormat === "splat" ||
-    activeAssetFormat === "ksplat" ||
-    activeAssetFormat === "spz";
-
+  // ---- annotation state ----
+  // Per-asset edit state, declared before the scene hook: the hook's
+  // onAssetLeave option (see the useSceneAssets call below) flushes and
+  // resets this state on every user-initiated switch that abandons the
+  // active asset.
   const [boxes, setBoxes] = useState<BBoxItem[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [placing, setPlacing] = useState(false);
@@ -655,6 +596,95 @@ export function BBoxMode() {
 
   const anchorZRef = useRef(0);
   anchorZRef.current = draftMin ? draftMin[2] : 0;
+
+  // The asset currently being annotated (cloud file in point-cloud mode,
+  // splat file in 3DGS mode) + the scene, mirrored into refs so the
+  // save/flush paths never see stale values. Declared here (the save
+  // queue reads them at flush time), assigned from the scene hook below.
+  const activeNameRef = useRef("");
+  const sceneRef = useRef("");
+
+  const persistBoxes = useCallback(
+    async (scene: string, name: string, list: BBoxItem[]) => {
+      const resp = await fetch("/api/bbox", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scene, name, boxes: list.map(toBBoxOutput) }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    },
+    [],
+  );
+
+  // Serialized save queue: concurrent POSTs could land out of order and roll
+  // the file back to an older snapshot, so every save chains onto the last.
+  // The chain itself swallows rejections (a rejected link would block all
+  // later saves), but the outcome is returned to the caller so handleSave
+  // can report failures instead of showing "saved" after an error.
+  const saveChainRef = useRef<Promise<void>>(Promise.resolve());
+  const enqueueSave = useCallback(
+    (name: string, list: BBoxItem[]) => {
+      // Capture the scene at enqueue time: the chained POST runs async and
+      // must persist into the scene the edits were made in, even if the
+      // user has already switched to another one.
+      const scene = sceneRef.current;
+      const p = saveChainRef.current.then(() => persistBoxes(scene, name, list));
+      saveChainRef.current = p.catch(() => {
+        // Surface auto-save failures instead of swallowing them.
+        setSaveState("error");
+        window.setTimeout(() => setSaveState("idle"), 2000);
+      });
+      return p;
+    },
+    [persistBoxes],
+  );
+
+  // Scene-rendering state — the ONE shared implementation (scene bucket,
+  // asset listing, selections, render mode, point-cloud loading) used by
+  // all three modes, wired identically to SceneGraph/Trajectory: the
+  // panel handlers come straight from the hook, with no local wrappers.
+  // BBox's only per-mode addition is onAssetLeave, fired by the hook on
+  // every user switch that abandons the active asset (scene / cloud /
+  // splat / render-mode): flush pending edits of the OLD asset (an empty
+  // list included — the user may have deleted every box), then reset the
+  // annotation state; the auto-load effect below repopulates from the
+  // new asset.
+  const {
+    scenes,
+    scene,
+    selectScene,
+    cloudFiles,
+    splatFiles,
+    renderMode,
+    setRenderMode,
+    selectedCloud,
+    selectCloud,
+    selectedSplat,
+    selectSplat,
+    activeName,
+    activeFormat,
+    activeUrl,
+    positions,
+    cloudLoading,
+    cloudError,
+  } = useSceneAssets(PCD_MAX_POINTS, {
+    onAssetLeave: () => {
+      if (dirtyRef.current) {
+        enqueueSave(activeNameRef.current, boxesRef.current).catch(() => {});
+      }
+      setBoxes([]);
+      setActiveId(null);
+      setPlacing(false);
+      setDraftMin(null);
+      historyRef.current = [];
+      dirtyRef.current = false;
+    },
+  });
+  activeNameRef.current = activeName;
+  sceneRef.current = scene;
+
+  const [splatLoading, setSplatLoading] = useState(false);
+  const [splatError, setSplatError] = useState<string | null>(null);
 
   const HISTORY_LIMIT = 100;
 
@@ -699,65 +729,17 @@ export function BBoxMode() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [undo]);
 
-  useEffect(() => {
-    // A stale persisted selection (file since deleted / never existed)
-    // would 404 on load; fall back to the first available cloud.
-    if (allCloudFiles.length > 0 && !allCloudFiles.includes(selectedCloudRef.current)) {
-      setSelectedCloud(allCloudFiles[0]!);
-    }
-  }, [allCloudFiles, setSelectedCloud]);
-
-  useEffect(() => {
-    return () => {
-      if (importedUrlRef.current) {
-        URL.revokeObjectURL(importedUrlRef.current);
-        importedUrlRef.current = null;
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    if (renderMode !== "pointcloud") return;
-    const format = activeAssetFormat;
-    if (format !== "pcd" && format !== "ply") {
-      setPositions(null);
-      setLoading(false);
-      return;
-    }
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    (async () => {
-      try {
-        const result =
-          format === "ply"
-            ? await loadPly(activeAssetUrl, PCD_MAX_POINTS)
-            : await loadPcd(activeAssetUrl, PCD_MAX_POINTS);
-        if (!cancelled) {
-          setPositions(result.positions);
-          setLoading(false);
-        }
-      } catch (e) {
-        if (!cancelled) {
-          setError(e instanceof Error ? e.message : String(e));
-          // Drop the previous asset's points: rendering them under the
-          // error banner would look like the new file loaded fine.
-          setPositions(null);
-          setLoading(false);
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [activeAssetUrl, activeAssetFormat, renderMode]);
-
   // Auto-load saved boxes for the currently active asset (if one exists).
+  // Keyed on [activeName, scene]: two scenes may hold an asset with the
+  // same file name, so the scene alone must re-trigger the load too.
   useEffect(() => {
+    if (!scene) return;
     let cancelled = false;
     (async () => {
       try {
-        const resp = await fetch(`/api/bbox?name=${encodeURIComponent(activeName)}`);
+        const resp = await fetch(
+          `/api/bbox?scene=${encodeURIComponent(scene)}&name=${encodeURIComponent(activeName)}`,
+        );
         if (resp.status === 404) return;
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
@@ -777,28 +759,12 @@ export function BBoxMode() {
     return () => {
       cancelled = true;
     };
-  }, [activeName]);
+  }, [activeName, scene]);
 
   const activeBox = useMemo(
     () => boxes.find((b) => b.id === activeId) ?? null,
     [boxes, activeId],
   );
-
-  // Keep the render mode compatible with the active asset: .pcd can only be
-  // a point cloud, splat-only formats can only be 3DGS. Without this, going
-  // back from 3DGS to a .pcd file strands the UI on the "unsupported" notice.
-  useEffect(() => {
-    if (activeAssetFormat === "pcd" && renderMode === "3dgs") {
-      setRenderMode("pointcloud");
-    } else if (
-      (activeAssetFormat === "splat" ||
-        activeAssetFormat === "ksplat" ||
-        activeAssetFormat === "spz") &&
-      renderMode === "pointcloud"
-    ) {
-      setRenderMode("3dgs");
-    }
-  }, [activeAssetFormat, renderMode]);
 
   const result = useMemo(
     () => (activeBox ? toBboxResult(activeBox.min, activeBox.max) : null),
@@ -947,102 +913,6 @@ export function BBoxMode() {
     );
   }, []);
 
-  const persistBoxes = useCallback(async (name: string, list: BBoxItem[]) => {
-    const resp = await fetch("/api/bbox", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, boxes: list.map(toBBoxOutput) }),
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  }, []);
-
-  // Serialized save queue: concurrent POSTs could land out of order and roll
-  // the file back to an older snapshot, so every save chains onto the last.
-  // The chain itself swallows rejections (a rejected link would block all
-  // later saves), but the outcome is returned to the caller so handleSave
-  // can report failures instead of showing "saved" after an error.
-  const saveChainRef = useRef<Promise<void>>(Promise.resolve());
-  const enqueueSave = useCallback(
-    (name: string, list: BBoxItem[]) => {
-      const p = saveChainRef.current.then(() => persistBoxes(name, list));
-      saveChainRef.current = p.catch(() => {
-        // Surface auto-save failures instead of swallowing them.
-        setSaveState("error");
-        window.setTimeout(() => setSaveState("idle"), 2000);
-      });
-      return p;
-    },
-    [persistBoxes],
-  );
-
-  const handleSelectCloud = useCallback(
-    (name: string) => {
-      // Flush any edits still inside the debounce window to the OLD asset
-      // before switching, so they are not silently dropped. An empty list is
-      // meaningful too (the user deleted every box): persist it instead of
-      // letting the old boxes resurrect on the next visit.
-      if (dirtyRef.current) {
-        enqueueSave(activeNameRef.current, boxesRef.current).catch(() => {});
-      }
-      setSelectedCloud(name);
-      if (importedUrlRef.current) {
-        URL.revokeObjectURL(importedUrlRef.current);
-        importedUrlRef.current = null;
-      }
-      setImported(null);
-      setBoxes([]);
-      setActiveId(null);
-      setPlacing(false);
-      setDraftMin(null);
-      historyRef.current = [];
-      dirtyRef.current = false;
-    },
-    [enqueueSave],
-  );
-
-  const handleImportFile = useCallback(
-    (file: File) => {
-      const format = detectCloudFormat(file.name);
-      if (!format) {
-        setError("不支持的文件类型（仅 .pcd/.ply/.splat/.ksplat/.spz）");
-        return;
-      }
-      // Flush pending edits of the previous asset before switching (an empty
-      // list included — see handleSelectCloud).
-      if (dirtyRef.current) {
-        enqueueSave(activeNameRef.current, boxesRef.current).catch(() => {});
-      }
-      if (importedUrlRef.current) URL.revokeObjectURL(importedUrlRef.current);
-      const url = URL.createObjectURL(file);
-      importedUrlRef.current = url;
-
-      // Keep selectedCloud untouched (it stays a server file); the imported
-      // file is tracked separately so it is not persisted to localStorage.
-      setImported({ name: file.name, url, format });
-      setBoxes([]);
-      setActiveId(null);
-      setPlacing(false);
-      setDraftMin(null);
-      historyRef.current = [];
-      dirtyRef.current = false;
-      setError(null);
-    },
-    [enqueueSave],
-  );
-
-  // Render-mode switch from the unified right-side scene panel. A .pcd asset
-  // cannot render as splats (the auto-revert effect would bounce straight
-  // back to Point Cloud), so switch to the first splat-capable file instead.
-  const handleRenderMode = useCallback(
-    (m: RenderMode) => {
-      if (m === "3dgs" && activeAssetFormat === "pcd" && splatFileList.length > 0) {
-        handleSelectCloud(splatFileList[0]!);
-      }
-      setRenderMode(m);
-    },
-    [activeAssetFormat, splatFileList, handleSelectCloud],
-  );
-
   const handleCopy = useCallback(async () => {
     if (!json) return;
     try {
@@ -1089,45 +959,57 @@ export function BBoxMode() {
     };
   }, [enqueueSave]);
 
+  // 3D content → shared persistent canvas (App level). The canvas and its
+  // WebGL context survive mode switches, so the splat viewer / point clouds
+  // re-attach from cache instantly.
+  useCanvasSlot(
+    <Scene
+      positions={positions}
+      pointSize={pointSize}
+      handleRadius={handleRadius}
+      lineWidth={lineWidth}
+      opacity={opacity}
+      boxes={boxes}
+      activeId={activeId}
+      placing={placing}
+      draftMin={draftMin}
+      anchorZRef={anchorZRef}
+      renderMode={renderMode}
+      splatSrc={renderMode === "3dgs" ? activeUrl : null}
+      splatFormat={(activeFormat ?? "ply") as SplatFormat}
+      onSplatLoadingChange={setSplatLoading}
+      onSplatError={setSplatError}
+      onPlace={handlePlace}
+      onDrag={handleDrag}
+      onDragStart={handleDragStart}
+      onSelectBox={handleSelectBox}
+    />,
+  );
+
   return (
-    <div style={{ width: "100%", height: "100%", position: "relative" }}>
+    <div
+      className="mode-overlay"
+      style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
+    >
       {/* Unified left-side scene panel shared by all three modes: render
           mode and the cloud/splat file list, with this mode's
           visualization parameters in a standalone panel below it. */}
       <div style={SCENE_COLUMN_STYLE}>
         <SceneAssetPanel
           renderMode={renderMode}
-          onRenderModeChange={handleRenderMode}
-          cloudFiles={cloudFileList}
-          selectedCloud={activeName}
-          onSelectCloud={handleSelectCloud}
-          splatFiles={splatFileList}
-          selectedSplat={activeName}
-          onSelectSplat={(name) => {
-            if (name !== null) handleSelectCloud(name);
-          }}
-          loading={renderMode === "pointcloud" ? loading : splatLoading}
-          error={renderMode === "pointcloud" ? error : splatError}
-        >
-          <input
-            ref={importInputRef}
-            type="file"
-            accept=".ply,.pcd,.splat,.ksplat,.spz"
-            style={{ display: "none" }}
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) handleImportFile(file);
-              e.target.value = "";
-            }}
-          />
-          <button
-            type="button"
-            onClick={() => importInputRef.current?.click()}
-            style={importBtnStyle}
-          >
-            本地导入文件…
-          </button>
-        </SceneAssetPanel>
+          onRenderModeChange={setRenderMode}
+          scenes={scenes}
+          selectedScene={scene}
+          onSelectScene={selectScene}
+          cloudFiles={cloudFiles}
+          selectedCloud={selectedCloud}
+          onSelectCloud={selectCloud}
+          splatFiles={splatFiles}
+          selectedSplat={selectedSplat}
+          onSelectSplat={selectSplat}
+          loading={renderMode === "pointcloud" ? cloudLoading : splatLoading}
+          error={renderMode === "pointcloud" ? cloudError : splatError}
+        />
 
         {/* Mode visualization panel — standalone list below the scene
             panel (column gap in between): the annotation display
@@ -1198,7 +1080,7 @@ export function BBoxMode() {
         />
       </div>
 
-      {renderMode === "pointcloud" && loading && (
+      {renderMode === "pointcloud" && cloudLoading && (
         <div
           style={{
             position: "absolute",
@@ -1215,7 +1097,7 @@ export function BBoxMode() {
         </div>
       )}
 
-      {renderMode === "pointcloud" && error && (
+      {renderMode === "pointcloud" && cloudError && (
         <div
           style={{
             position: "absolute",
@@ -1230,11 +1112,11 @@ export function BBoxMode() {
             fontFamily: "monospace",
           }}
         >
-          {error}
+          {cloudError}
         </div>
       )}
 
-      {renderMode === "3dgs" && canRender3dgs && splatLoading && (
+      {renderMode === "3dgs" && splatLoading && (
         <div
           style={{
             position: "absolute",
@@ -1251,7 +1133,7 @@ export function BBoxMode() {
         </div>
       )}
 
-      {renderMode === "3dgs" && canRender3dgs && splatError && (
+      {renderMode === "3dgs" && splatError && (
         <div
           style={{
             position: "absolute",
@@ -1269,45 +1151,6 @@ export function BBoxMode() {
           {splatError}
         </div>
       )}
-
-      {renderMode === "3dgs" && !canRender3dgs && (
-        <div
-          style={{
-            position: "absolute",
-            top: "50%",
-            left: "50%",
-            transform: "translate(-50%,-50%)",
-            color: "#888",
-            fontFamily: "monospace",
-            fontSize: 14,
-            pointerEvents: "none",
-          }}
-        >
-          当前文件（.{activeAssetFormat}）不支持 3DGS 渲染，请选择 .ply / .splat / .ksplat / .spz 文件
-        </div>
-      )}
-
-      <Scene
-        positions={positions}
-        pointSize={pointSize}
-        handleRadius={handleRadius}
-        lineWidth={lineWidth}
-        opacity={opacity}
-        boxes={boxes}
-        activeId={activeId}
-        placing={placing}
-        draftMin={draftMin}
-        anchorZRef={anchorZRef}
-        renderMode={renderMode}
-        splatSrc={renderMode === "3dgs" && canRender3dgs ? activeAssetUrl : null}
-        splatFormat={activeAssetFormat as SplatFormat}
-        onSplatLoadingChange={setSplatLoading}
-        onSplatError={setSplatError}
-        onPlace={handlePlace}
-        onDrag={handleDrag}
-        onDragStart={handleDragStart}
-        onSelectBox={handleSelectBox}
-      />
     </div>
   );
 }

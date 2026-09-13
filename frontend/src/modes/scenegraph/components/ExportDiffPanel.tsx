@@ -9,6 +9,7 @@ import { TopologicalEdges } from "./TopologicalEdges";
 import { WorldAxes } from "./WorldAxes";
 
 interface Props {
+  scene: string;
   snapshot: string;
   onClose: () => void;
 }
@@ -83,7 +84,7 @@ function StatsBar({ label, data, color }: { label: string; data: SceneData; colo
 
 // ---- main panel ----
 
-export function ExportDiffPanel({ snapshot, onClose }: Props) {
+export function ExportDiffPanel({ scene, snapshot, onClose }: Props) {
   const [saved, setSaved] = useState<SceneData | null>(null);
   const [exported, setExported] = useState<SceneData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -100,8 +101,8 @@ export function ExportDiffPanel({ snapshot, onClose }: Props) {
     (async () => {
       try {
         const [s, e] = await Promise.all([
-          loadSceneGraph(`/api/scene-graph?snapshot=${snapshot}&source=saved`),
-          loadSceneGraph(`/api/scene-graph?snapshot=${snapshot}&source=exported`),
+          loadSceneGraph(`/api/scene-graph?scene=${encodeURIComponent(scene)}&snapshot=${encodeURIComponent(snapshot)}&source=saved`),
+          loadSceneGraph(`/api/scene-graph?scene=${encodeURIComponent(scene)}&snapshot=${encodeURIComponent(snapshot)}&source=exported`),
         ]);
         setSaved(s.data);
         setExported(e.data);
@@ -111,7 +112,7 @@ export function ExportDiffPanel({ snapshot, onClose }: Props) {
         setLoading(false);
       }
     })();
-  }, [snapshot]);
+  }, [scene, snapshot]);
 
   if (loading) {
     return (

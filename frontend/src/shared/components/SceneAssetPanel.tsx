@@ -105,6 +105,12 @@ interface Props {
   renderMode: SceneRenderMode;
   onRenderModeChange: (m: SceneRenderMode) => void;
 
+  /** Available scenes (subdirectories of scenes/ on the backend). */
+  scenes: string[];
+  /** Current scene selection ("" while unresolved). */
+  selectedScene: string;
+  onSelectScene: (scene: string) => void;
+
   /** Files selectable in Point Cloud mode (typically .pcd/.ply). */
   cloudFiles: string[];
   /** Current selection. */
@@ -124,12 +130,16 @@ interface Props {
 
 /**
  * Unified scene-selection panel used by all three modes (BBox-styled):
- * render mode (Point Cloud / Gaussian Splatting) and a plain scene-file
- * list, followed by mode-specific visualization parameters.
+ * 基本参数 — 场景名称 (subdirectory of scenes/), 原始文件 (cloud/splat
+ * asset of the active scene) and 渲染模式 (Point Cloud / Gaussian
+ * Splatting), followed by mode-specific visualization parameters.
  */
 export function SceneAssetPanel({
   renderMode,
   onRenderModeChange,
+  scenes,
+  selectedScene,
+  onSelectScene,
   cloudFiles,
   selectedCloud,
   onSelectCloud,
@@ -141,7 +151,8 @@ export function SceneAssetPanel({
   children = null,
 }: Props) {
   // Keep a valid selection visible even when the active file is not part of
-  // the listing (e.g. a locally imported asset in BBox mode).
+  // the listing (e.g. a stale persisted selection before the listing
+  // arrives).
   const cloudOptions =
     selectedCloud && !cloudFiles.includes(selectedCloud)
       ? [selectedCloud, ...cloudFiles]
@@ -165,30 +176,32 @@ export function SceneAssetPanel({
           gap: 6,
         }}
       >
-        <span style={{ color: "#3498db" }}>◈</span> 场景
+        <span style={{ color: "#3498db" }}>◈</span> 基本参数
       </div>
 
-      <div style={SECTION_LABEL}>Render Mode</div>
+      <div style={SECTION_LABEL}>场景名称</div>
       <select
-        value={renderMode}
-        onChange={(e) => onRenderModeChange(e.target.value as SceneRenderMode)}
+        value={selectedScene}
+        onChange={(e) => onSelectScene(e.target.value)}
         style={{ ...selectStyle, marginBottom: 8 }}
       >
-        <option value="pointcloud">Point Cloud</option>
-        <option value="3dgs" disabled={splatFiles.length === 0}>
-          Gaussian Splatting {splatFiles.length === 0 ? "(no splat files)" : ""}
-        </option>
+        {scenes.length === 0 && <option value="">{selectedScene || "…"}</option>}
+        {scenes.map((name) => (
+          <option key={name} value={name}>
+            ◆ {name}
+          </option>
+        ))}
       </select>
 
       {renderMode === "pointcloud" ? (
         <>
-          <div style={SECTION_LABEL}>Point Cloud</div>
+          <div style={SECTION_LABEL}>原始文件</div>
           <select
             value={selectedCloud}
             onChange={(e) => onSelectCloud(e.target.value)}
-            style={selectStyle}
+            style={{ ...selectStyle, marginBottom: 8 }}
           >
-            <optgroup label="Scene Clouds">
+            <optgroup label="场景文件">
               {cloudOptions.map((name) => (
                 <option key={name} value={name}>
                   ◆ {name}
@@ -199,11 +212,11 @@ export function SceneAssetPanel({
         </>
       ) : (
         <>
-          <div style={SECTION_LABEL}>Gaussian Splat</div>
+          <div style={SECTION_LABEL}>原始文件</div>
           <select
             value={selectedSplat ?? ""}
             onChange={(e) => onSelectSplat(e.target.value || null)}
-            style={selectStyle}
+            style={{ ...selectStyle, marginBottom: 8 }}
           >
             {splatOptions.map((name) => (
               <option key={name} value={name}>
@@ -214,9 +227,21 @@ export function SceneAssetPanel({
         </>
       )}
 
+      <div style={SECTION_LABEL}>渲染模式</div>
+      <select
+        value={renderMode}
+        onChange={(e) => onRenderModeChange(e.target.value as SceneRenderMode)}
+        style={selectStyle}
+      >
+        <option value="pointcloud">点云</option>
+        <option value="3dgs" disabled={splatFiles.length === 0}>
+          高斯泼溅
+        </option>
+      </select>
+
       {loading && (
         <div style={{ color: "#8ab4d8", marginTop: 6, fontSize: 12 }}>
-          Loading…
+          加载中…
         </div>
       )}
       {error && (

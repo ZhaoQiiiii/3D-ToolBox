@@ -158,6 +158,7 @@ export interface Mutations {
 }
 
 export interface ExportRequest {
+  scene: string;
   snapshot: string;
   mutations: Mutations;
   base: "saved" | "exported";

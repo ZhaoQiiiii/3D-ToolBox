@@ -1,24 +1,30 @@
 /**
- * Vite plugin that adds every HTTP endpoint used by 3D-BBox-Tool (dual mode).
+ * Vite plugin that adds every HTTP endpoint used by 3D-ToolBox (dual mode).
+ *
+ * ── Scene layout ──────────────────────────────────────────────────────
+ * All initial data is bucketed per scene under scenes/<scene>/:
+ *   scenes/<scene>/elec.ply            → cloud/splat assets (flat)
+ *   scenes/<scene>/bboxes/             → BBox annotations (<asset>.json)
+ *   scenes/<scene>/scene_graph_saved/  → SceneGraph snapshots (read-only source)
+ *   scenes/<scene>/scene_graph_exported/ → SceneGraph exports
+ * Every endpoint below takes a `scene` query param (single directory
+ * component, validated like a file name) selecting one of those buckets.
  *
  * ── BBox annotation mode ──────────────────────────────────────────────
- * - GET  /api/pointcloud-files     → list cloud/splat files under scenes/
- * - GET  /api/pcd?name=elec.ply    → stream a scene asset from scenes/
- * - GET  /api/bbox?name=elec.ply   → load saved labelled boxes for an asset
- * - POST /api/bbox                 → persist labelled boxes (per-asset + legacy)
+ * - GET  /api/scenes                          → list scene directories
+ * - GET  /api/pointcloud-files?scene=X        → list cloud/splat assets
+ * - GET  /api/pcd?scene=X&name=elec.ply       → stream a scene asset
+ * - GET  /api/bbox?scene=X&name=elec.ply      → load saved labelled boxes
+ * - POST /api/bbox                            → persist boxes ({scene,name,boxes})
  *
  * ── SceneGraph edit mode ──────────────────────────────────────────────
- * Snapshot data lives in the bundled scene_graph/ directory:
- * scene_graph_saved/ is read-only source data; exports always go to
- * scene_graph_exported/ under the same root.
- *
- * - GET  /api/scene-pcds                   → alias of /api/pointcloud-files
- * - GET  /api/pcd?snapshot=X&path=objects/… → per-object cloud (exported/ first)
- * - GET  /api/pcd?source=scene&name=X      → scene asset from scenes/
- * - GET  /api/snapshot | /api/snapshots    → latest / all snapshots
- * - GET  /api/scene-graph                   → scene_graph.json (exported/ first)
- * - POST /api/export                        → apply mutations, write exported/
- * - POST /api/log                           → client-side event sink
+ * - GET  /api/scene-pcds?scene=X                      → alias of pointcloud-files
+ * - GET  /api/pcd?scene=X&snapshot=S&path=objects/…   → per-object cloud (exported/ first)
+ * - GET  /api/pcd?scene=X&source=scene&name=X         → scene asset
+ * - GET  /api/snapshot?scene=X | /api/snapshots?scene=X → latest / all snapshots
+ * - GET  /api/scene-graph?scene=X&snapshot=S          → scene_graph.json (exported/ first)
+ * - POST /api/export                                  → apply mutations, write exported/
+ * - POST /api/log                                      → client-side event sink
  *
  * ── Trajectory visualization mode ────────────────────────────────────
  * Browsing is fixed to trajectories/ (TRAJ_ROOT): the UI walks worldmodel
@@ -31,8 +37,8 @@
  * - GET  /api/traj-asset?path=…&name=…   → anchor.jpg / video.mp4 (Range-capable)
  *
  * Route split for /api/pcd: SceneGraph-mode requests always carry `snapshot`
- * or `source`; a plain `?name=` belongs to the BBox mode. The split is made
- * on that explicit criteria (NOT query shape guessing).
+ * or `source`; a plain `?name=` belongs to the BBox/Trajectory modes. The
+ * split is made on that explicit criteria (NOT query shape guessing).
  */
 import type { Plugin, ViteDevServer } from "vite";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -125,6 +131,14 @@ function isValidFileName(name: unknown): name is string {
 
 /** Snapshot names face the same constraint (single directory component). */
 function isValidSnapshotName(name: unknown): name is string {
+  return isValidFileName(name);
+}
+
+/**
+ * Scene names select one subdirectory of scenes/ and face the same
+ * constraint as file names (single directory component, no "..").
+ */
+function isValidSceneName(name: unknown): name is string {
   return isValidFileName(name);
 }
 
@@ -1219,43 +1233,65 @@ function logToFile(scope: string, event: string, detail?: unknown): void {
 
 export function apiPlugin(): Plugin {
   const PROJECT_ROOT = join(import.meta.dirname, "..");
-  const BBOX_DIR = join(PROJECT_ROOT, "bboxes");
-  // Fixed cloud/splat data root: only the bundled scenes/ directory is ever
-  // served (the ?name= / ?source=scene lookups and the file listing all read
-  // from it). Runtime path switching was removed on purpose — every asset the
-  // tool visualizes lives in its designated folder under the project.
-  const SCENE_ROOT = join(PROJECT_ROOT, "scenes");
+  // Fixed per-scene data root. Every initial data bucket lives under
+  // scenes/<scene>/: cloud/splat assets (flat), bboxes/, scene_graph_saved/
+  // and scene_graph_exported/. Runtime path switching was removed on
+  // purpose — every asset the tool visualizes lives in its designated
+  // folder under the project.
+  const SCENES_ROOT = join(PROJECT_ROOT, "scenes");
 
   // Fixed trajectory browsing root: worldmodel flight_/step_ directories are
   // only ever read from inside trajectories/.
   const TRAJ_ROOT = join(PROJECT_ROOT, "trajectories");
-
-  // Fixed SceneGraph snapshot data root: scene_graph_saved/ (read-only
-  // source) + scene_graph_exported/ (exports) live under scene_graph/.
-  const SG_ROOT = join(PROJECT_ROOT, "scene_graph");
 
   // Initialize the log directory on plugin setup. Each `bun run dev` restart
   // gets its own timestamped file: logs/YYYY-MM-DD_HH-MM-SS.log
   logDir = join(PROJECT_ROOT, "logs");
   logFileName = `${localTimestamp(new Date())}.log`;
   mkdirSync(logDir, { recursive: true });
-  logToFile("server", "dev server starting", { sgRoot: SG_ROOT });
+  logToFile("server", "dev server starting", { scenesRoot: SCENES_ROOT });
 
   return {
     name: "3d-bbox-tool-api",
     configureServer(server: ViteDevServer) {
       // ---- BBox mode: list + serve scene assets, persist boxes ----
 
-      // List cloud/splat files in the bundled scenes/ directory. Consumers
-      // filter for themselves (the BBox dropdown keeps .pcd/.ply, the
-      // SceneGraph splat picker accepts every cloud format). Registered
-      // under both the BBox and the SceneGraph legacy path.
+      // List the per-scene directories under scenes/ — the first-level
+      // scene picker shown by every mode.
+      server.middlewares.use(
+        "/api/scenes",
+        async (_req: IncomingMessage, res: ServerResponse) => {
+          try {
+            const scenes = readdirSync(SCENES_ROOT, { withFileTypes: true })
+              .filter((e) => e.isDirectory())
+              .map((e) => ({ name: e.name }))
+              .sort((a, b) => a.name.localeCompare(b.name));
+            sendJson(res, 200, { scenes });
+          } catch (err: any) {
+            sendJson(res, 500, { success: false, error: err.message });
+          }
+        },
+      );
+
+      // List cloud/splat files in scenes/<scene>/. Consumers filter for
+      // themselves (the BBox dropdown keeps .pcd/.ply, the SceneGraph
+      // splat picker accepts every cloud format). Registered under both
+      // the BBox and the SceneGraph legacy path.
       const listCloudFiles = async (
-        _req: IncomingMessage,
+        req: IncomingMessage,
         res: ServerResponse,
       ) => {
         try {
-          const files = readdirSync(SCENE_ROOT)
+          const url = new URL(
+            req.url || "",
+            `http://${req.headers.host || "localhost"}`,
+          );
+          const scene = url.searchParams.get("scene");
+          if (!isValidSceneName(scene)) {
+            sendJson(res, 400, { success: false, error: "Missing/invalid scene" });
+            return;
+          }
+          const files = readdirSync(join(SCENES_ROOT, scene))
             .filter((f) => isCloudFileName(f))
             .map((f) => ({ name: f }));
           sendJson(res, 200, { files });
@@ -1266,13 +1302,15 @@ export function apiPlugin(): Plugin {
       server.middlewares.use("/api/pointcloud-files", listCloudFiles);
       server.middlewares.use("/api/scene-pcds", listCloudFiles);
 
-      // Unified cloud/splat file endpoint, shared by both modes.
+      // Unified cloud/splat file endpoint, shared by all modes.
       //
-      // SceneGraph-mode requests always carry `snapshot` or `source`:
+      // Every request carries ?scene=X (the subdirectory of scenes/ to read
+      // from). SceneGraph-mode requests additionally carry `snapshot` or
+      // `source`:
       //   ?snapshot=X&path=objects/object_N_cloud.pcd  (exported/ first)
       //   ?source=scene&name=elec.ply
-      // A plain ?name=… belongs to the BBox mode and reads the bundled
-      // scenes/ directory.
+      // A plain ?name=… belongs to the BBox/Trajectory modes and reads the
+      // scene's asset directory directly.
       server.middlewares.use(
         "/api/pcd",
         async (req: IncomingMessage, res: ServerResponse) => {
@@ -1285,6 +1323,11 @@ export function apiPlugin(): Plugin {
               req.url || "",
               `http://${req.headers.host || "localhost"}`,
             );
+            const scene = url.searchParams.get("scene");
+            if (!isValidSceneName(scene)) {
+              sendJson(res, 400, { success: false, error: "Missing/invalid scene" });
+              return;
+            }
             const snapshot = url.searchParams.get("snapshot");
             const source = url.searchParams.get("source");
             let filePath: string;
@@ -1304,7 +1347,7 @@ export function apiPlugin(): Plugin {
                   sendJson(res, 400, { success: false, error: "Invalid name" });
                   return;
                 }
-                filePath = join(SCENE_ROOT, name);
+                filePath = join(SCENES_ROOT, scene, name);
               } else {
                 const relPath = url.searchParams.get("path");
                 if (
@@ -1324,22 +1367,26 @@ export function apiPlugin(): Plugin {
                 }
                 // Prefer exported/ (may contain renamed object files),
                 // fall back to saved/ — same order as /api/scene-graph.
-                const exportedFile = join(SG_ROOT, "scene_graph_exported", snapshot, relPath);
+                const exportedFile = join(
+                  SCENES_ROOT, scene, "scene_graph_exported", snapshot, relPath,
+                );
                 try {
                   statSync(exportedFile);
                   filePath = exportedFile;
                 } catch {
-                  filePath = join(SG_ROOT, "scene_graph_saved", snapshot, relPath);
+                  filePath = join(
+                    SCENES_ROOT, scene, "scene_graph_saved", snapshot, relPath,
+                  );
                 }
               }
             } else {
-              // ---- BBox mode: plain ?name= ----
+              // ---- BBox/Trajectory mode: plain ?name= ----
               const name = url.searchParams.get("name");
               if (!isValidFileName(name) || !isCloudFileName(name)) {
                 sendJson(res, 400, { success: false, error: "Invalid name" });
                 return;
               }
-              filePath = join(SCENE_ROOT, name);
+              filePath = join(SCENES_ROOT, scene, name);
             }
 
             streamFile(res, filePath);
@@ -1370,12 +1417,17 @@ export function apiPlugin(): Plugin {
                 req.url || "",
                 `http://${req.headers.host || "localhost"}`,
               );
+              const scene = url.searchParams.get("scene");
               const name = url.searchParams.get("name");
+              if (!isValidSceneName(scene)) {
+                sendJson(res, 400, { success: false, error: "Missing/invalid scene" });
+                return;
+              }
               if (!isValidFileName(name) || !isKnownAssetName(name)) {
                 sendJson(res, 400, { success: false, error: "Invalid name" });
                 return;
               }
-              const filePath = join(BBOX_DIR, `${name}.json`);
+              const filePath = join(SCENES_ROOT, scene, "bboxes", `${name}.json`);
               const data = JSON.parse(readFileSync(filePath, "utf-8"));
               sendJson(res, 200, data);
             } catch {
@@ -1395,7 +1447,12 @@ export function apiPlugin(): Plugin {
           try {
             const body = await readBody(req);
             const payload = JSON.parse(body);
+            const scene = payload.scene;
             const name = payload.name;
+            if (!isValidSceneName(scene)) {
+              sendJson(res, 400, { success: false, error: "Missing/invalid scene" });
+              return;
+            }
             if (!isValidFileName(name) || !isKnownAssetName(name)) {
               sendJson(res, 400, { success: false, error: "Invalid name" });
               return;
@@ -1407,7 +1464,7 @@ export function apiPlugin(): Plugin {
               return;
             }
 
-            const perCloudPath = join(BBOX_DIR, `${name}.json`);
+            const perCloudPath = join(SCENES_ROOT, scene, "bboxes", `${name}.json`);
             writeJson(perCloudPath, { name, boxes });
 
             const first = boxes[0];
@@ -1485,18 +1542,24 @@ export function apiPlugin(): Plugin {
           try {
             const body = await readBody(req);
             const payload: ExportRequest = JSON.parse(body);
+            if (!isValidSceneName(payload.scene)) {
+              sendJson(res, 400, { success: false, error: "Missing/invalid scene" });
+              return;
+            }
             if (!isValidSnapshotName(payload.snapshot)) {
               sendJson(res, 400, { success: false, error: "Invalid snapshot name" });
               return;
             }
+            const scene = payload.scene;
             const t0 = Date.now();
             logToFile("export", "request", {
+              scene,
               snapshot: payload.snapshot,
               base: payload.base,
               renameCount: payload.mutations?.updateObjectIds?.length ?? 0,
             });
-            const savedDir = join(SG_ROOT, "scene_graph_saved", payload.snapshot);
-            const exportedDir = join(SG_ROOT, "scene_graph_exported", payload.snapshot);
+            const savedDir = join(SCENES_ROOT, scene, "scene_graph_saved", payload.snapshot);
+            const exportedDir = join(SCENES_ROOT, scene, "scene_graph_exported", payload.snapshot);
 
             // Read from exported/ if base is "exported" (file exists), else fall back to saved/
             let sourcePath: string;
@@ -1554,9 +1617,17 @@ export function apiPlugin(): Plugin {
 
       server.middlewares.use(
         "/api/snapshot",
-        async (_req: IncomingMessage, res: ServerResponse) => {
+        async (req: IncomingMessage, res: ServerResponse) => {
           try {
-            const name = findLatestSnapshot(join(SG_ROOT, "scene_graph_saved"));
+            const url = new URL(req.url || "", `http://${req.headers.host || "localhost"}`);
+            const scene = url.searchParams.get("scene");
+            if (!isValidSceneName(scene)) {
+              sendJson(res, 400, { success: false, error: "Missing/invalid scene" });
+              return;
+            }
+            const name = findLatestSnapshot(
+              join(SCENES_ROOT, scene, "scene_graph_saved"),
+            );
             sendJson(res, 200, { snapshot: name });
           } catch (err: any) {
             sendJson(res, 500, { success: false, error: err.message });
@@ -1564,12 +1635,18 @@ export function apiPlugin(): Plugin {
         },
       );
 
-      // List all available snapshots from scene_graph_saved/
+      // List all available snapshots from scenes/<scene>/scene_graph_saved/
       server.middlewares.use(
         "/api/snapshots",
-        async (_req: IncomingMessage, res: ServerResponse) => {
+        async (req: IncomingMessage, res: ServerResponse) => {
           try {
-            const savedDir = join(SG_ROOT, "scene_graph_saved");
+            const url = new URL(req.url || "", `http://${req.headers.host || "localhost"}`);
+            const scene = url.searchParams.get("scene");
+            if (!isValidSceneName(scene)) {
+              sendJson(res, 400, { success: false, error: "Missing/invalid scene" });
+              return;
+            }
+            const savedDir = join(SCENES_ROOT, scene, "scene_graph_saved");
             const entries = readdirSync(savedDir, { withFileTypes: true })
               .filter((e) => e.isDirectory())
               .filter((e) => {
@@ -1623,6 +1700,11 @@ export function apiPlugin(): Plugin {
           }
           try {
             const url = new URL(req.url || "", `http://${req.headers.host || "localhost"}`);
+            const scene = url.searchParams.get("scene");
+            if (!isValidSceneName(scene)) {
+              sendJson(res, 400, { success: false, error: "Missing/invalid scene" });
+              return;
+            }
             const snapshot = url.searchParams.get("snapshot");
             if (!snapshot) {
               sendJson(res, 400, { success: false, error: "Missing snapshot query param" });
@@ -1633,8 +1715,8 @@ export function apiPlugin(): Plugin {
               return;
             }
 
-            const savedPath = join(SG_ROOT, "scene_graph_saved", snapshot, "scene_graph.json");
-            const exportedPath = join(SG_ROOT, "scene_graph_exported", snapshot, "scene_graph.json");
+            const savedPath = join(SCENES_ROOT, scene, "scene_graph_saved", snapshot, "scene_graph.json");
+            const exportedPath = join(SCENES_ROOT, scene, "scene_graph_exported", snapshot, "scene_graph.json");
             const source = url.searchParams.get("source") || "auto";
 
             let jsonPath: string;

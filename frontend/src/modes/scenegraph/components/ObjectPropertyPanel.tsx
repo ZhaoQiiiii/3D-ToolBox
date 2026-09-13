@@ -380,10 +380,17 @@ function AxisRow({
 
   const commitFromDraft = useCallback(() => {
     const v = Number(Number(draft).toFixed(2));
-    if (!Number.isFinite(v)) {
+    // An empty/whitespace draft must revert to the committed value —
+    // Number("") is 0, so without the trim check a cleared field would
+    // silently commit the axis to 0 on blur.
+    if (draft.trim() === "" || !Number.isFinite(v)) {
       setDraft(localValue.toFixed(2));
       return;
     }
+    // Skip the commit when the draft matches the already-committed value —
+    // otherwise a blur after a step-button commit would push a duplicate
+    // (no-op) entry onto the undo history.
+    if (v === localValue) return;
     setLocal(v);
     commitAxis(axis, v);
   }, [draft, localValue, axis, setLocal, commitAxis]);
@@ -410,14 +417,19 @@ function AxisRow({
   const handleStep = useCallback(
     (delta: number) => {
       const base = Number(draft);
-      const current = Number.isFinite(base) ? base : localValue;
+      // Empty draft must fall back to the committed value (Number("") is 0).
+      const current = draft.trim() !== "" && Number.isFinite(base) ? base : localValue;
       const next = Number((current + delta).toFixed(2));
       if (!Number.isFinite(next)) return;
       setDraft(next.toFixed(2));
       setLocal(next);
-      previewAxis(axis, next);
+      // Commit (not just preview): the step buttons suppress input focus
+      // (mousedown preventDefault), so no blur ever fires to commit a
+      // preview-only change — it would leave `dirty` false and Export
+      // disabled even though the toolbar badge counts the live preview.
+      commitAxis(axis, next);
     },
-    [draft, localValue, axis, setLocal, previewAxis],
+    [draft, localValue, axis, setLocal, commitAxis],
   );
 
   return (

@@ -1,5 +1,7 @@
 import { Suspense, lazy, useEffect, useState } from "react";
 import type { CSSProperties } from "react";
+import { Canvas } from "@react-three/fiber";
+import { CanvasSlot } from "./shared/canvas-slot";
 
 // Each mode is a self-contained subtree (own state, own panels, own canvas);
 // they are lazily loaded so the initial bundle only contains the active one.
@@ -38,9 +40,16 @@ function loadStoredMode(): AppMode {
 }
 
 /**
- * Application shell: a top-right mode switcher plus the lazily loaded mode
- * subtree. The switcher floats at top-right (16,16) — free in both modes
- * (BBox panel is top-left, the SceneGraph edit toolbar is top-center).
+ * Application shell: ONE persistent WebGL canvas plus the lazily loaded mode
+ * subtree. The canvas never unmounts on a mode switch — each mode renders
+ * its 3D content into it through useCanvasSlot() and keeps only its DOM
+ * overlays in its own subtree. This preserves the WebGL context (and with it
+ * the 3DGS viewers' GPU resources and the point-cloud buffers) across mode
+ * switches, so switching modes never reloads the scene.
+ *
+ * The mode overlays sit ABOVE the canvas with pointer-events disabled on the
+ * root and re-enabled per panel (.mode-overlay > *); canvas orbit/zoom/drag
+ * keeps working everywhere the panels don't cover.
  */
 export function App() {
   const [mode, setMode] = useState<AppMode>(loadStoredMode);
@@ -52,7 +61,18 @@ export function App() {
   }, [mode]);
 
   return (
-    <div style={{ width: "100%", height: "100%", position: "relative" }}>
+    <div style={{ width: "100%", height: "100%", position: "relative", background: "#0b0b12" }}>
+      <style>{`.mode-overlay > * { pointer-events: auto; }`}</style>
+
+      {/* The persistent render surface shared by all three modes. */}
+      <Canvas
+        style={{ position: "absolute", inset: 0 }}
+        dpr={[1, 2]}
+        onContextMenu={(e) => e.preventDefault()}
+      >
+        <CanvasSlot />
+      </Canvas>
+
       <div style={switcherStyle}>
         {MODE_LABELS.map(({ id, label }) => (
           <button

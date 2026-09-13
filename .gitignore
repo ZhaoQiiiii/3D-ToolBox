@@ -21,19 +21,14 @@ bbox_result.json
 logs/
 *.log
 
-# Scene data (large point clouds / splats — keep only the dir placeholder)
+# Scene data (per-scene buckets: point clouds / splats / bboxes /
+# scene_graph_{saved,exported} — keep only the dir placeholder)
 scenes/*
 !scenes/.gitkeep
 
 # Trajectory data (worldmodel flight_*/step_* dirs — large, keep placeholder only)
 trajectories/*
 !trajectories/.gitkeep
-
-# SceneGraph snapshot data (source + exported — large, keep placeholder only)
-scene_graph/*
-!scene_graph/.gitkeep
-
-bboxes/
 
 # OS junk
 .DS_Store

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import { Canvas, useThree } from "@react-three/fiber";
+import { useThree } from "@react-three/fiber";
 import type { ThreeEvent } from "@react-three/fiber";
 import { OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import * as THREE from "three";
@@ -14,10 +14,10 @@ import {
   SCENE_COLUMN_STYLE,
   SceneAssetPanel,
 } from "../../shared/components/SceneAssetPanel";
-import { loadPcd, loadPly } from "../../shared/pcd-loader";
-import { detectCloudFormat, splatFormatOf } from "../../shared/splat-format";
+import { type SplatFormat } from "../../shared/splat-format";
 import { createLocalStorageHook } from "../../shared/use-local-storage";
-import { useCloudFiles } from "../../shared/use-cloud-files";
+import { useSceneAssets } from "../../shared/use-scene-assets";
+import { useCanvasSlot } from "../../shared/canvas-slot";
 import {
   Y_UP,
   rayHitHorizontalPlane,
@@ -100,16 +100,30 @@ export function TrajectoryMode() {
   const [result, setResult] = useState<ResultInfo | null>(null);
 
   // ---- scene ----
-  const { files: sceneFiles } = useCloudFiles("/api/pointcloud-files");
-  // Not persisted: always starts on "pointcloud" regardless of prior choice
-  // (same convention as the other two modes).
-  const [renderMode, setRenderMode] = useState<RenderMode>("pointcloud");
-  const [sceneFile, setSceneFile] = useLocalStorageState("sceneFile", "elec.ply");
+  // Scene-rendering state — the ONE shared implementation (scene bucket,
+  // asset listing, selections, render mode, point-cloud loading) used by
+  // all three modes. Trajectory only adds its step/playback state on top.
+  const {
+    scenes,
+    scene,
+    selectScene,
+    cloudFiles,
+    splatFiles,
+    renderMode,
+    setRenderMode,
+    selectedCloud,
+    selectCloud,
+    selectedSplat,
+    selectSplat,
+    activeFormat,
+    activeUrl,
+    positions,
+    cloudLoading,
+    cloudError,
+  } = useSceneAssets(SCENE_PCD_MAX_POINTS);
   const [pointSize, setPointSize] = useLocalStorageState("pointSize", 0.02);
-  const [positions, setPositions] = useState<Float32Array | null>(null);
-  const [sceneLoading, setSceneLoading] = useState(false);
-  const [sceneError, setSceneError] = useState<string | null>(null);
   const [splatLoading, setSplatLoading] = useState(false);
+  const [splatError, setSplatError] = useState<string | null>(null);
 
   // ---- placement & playback ----
   const [offset, setOffset] = useState<[number, number, number]>([0, 0, 0]);
@@ -120,29 +134,6 @@ export function TrajectoryMode() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   // Monotonic token for browse requests (see doBrowse).
   const browseSeqRef = useRef(0);
-
-  // Split the shared cloud listing for the unified right-side scene panel.
-  const cloudFileList = useMemo(
-    () =>
-      sceneFiles.filter((n) => {
-        const f = detectCloudFormat(n);
-        return f === "pcd" || f === "ply";
-      }),
-    [sceneFiles],
-  );
-  const splatFileList = useMemo(
-    () => sceneFiles.filter((n) => splatFormatOf(n) !== null),
-    [sceneFiles],
-  );
-
-  // A stale persisted scene selection would 404; fall back to the first
-  // available file for the active render mode.
-  useEffect(() => {
-    const list = renderMode === "3dgs" ? splatFileList : cloudFileList;
-    if (list.length > 0 && !list.includes(sceneFile)) {
-      setSceneFile(list[0]!);
-    }
-  }, [renderMode, cloudFileList, splatFileList, sceneFile, setSceneFile]);
 
   const doBrowse = useCallback(async (path?: string) => {
     const trimmed = path?.trim() ?? "";
@@ -260,38 +251,6 @@ export function TrajectoryMode() {
     };
   }, [selectedStep]);
 
-  // Load the scene cloud (point-cloud mode). 3DGS is handled inside the
-  // canvas by the shared GaussianSplatLayer.
-  useEffect(() => {
-    if (renderMode !== "pointcloud") {
-      setPositions(null);
-      return;
-    }
-    let cancelled = false;
-    setSceneLoading(true);
-    setSceneError(null);
-    const url = `/api/pcd?name=${encodeURIComponent(sceneFile)}`;
-    (async () => {
-      try {
-        const r =
-          sceneFile.toLowerCase().endsWith(".pcd")
-            ? await loadPcd(url, SCENE_PCD_MAX_POINTS)
-            : await loadPly(url, SCENE_PCD_MAX_POINTS);
-        if (!cancelled) setPositions(r.positions);
-      } catch (e) {
-        if (!cancelled) {
-          setPositions(null);
-          setSceneError(e instanceof Error ? e.message : String(e));
-        }
-      } finally {
-        if (!cancelled) setSceneLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [renderMode, sceneFile]);
-
   // Playback: advance the playhead; stop at the last point. setPlaying runs
   // in its own effect below — calling it inside the setPlayIndex updater
   // would be a side effect in a function React requires to be pure
@@ -338,30 +297,35 @@ export function TrajectoryMode() {
       ? traj.points[Math.min(playIndex, pointCount - 1)]!
       : null;
 
+  // 3D content → shared persistent canvas (App level). The canvas and its
+  // WebGL context survive mode switches, so the splat viewer / point clouds
+  // re-attach from cache instantly.
+  useCanvasSlot(
+    <TrajScene
+      renderMode={renderMode}
+      splatSrc={renderMode === "3dgs" ? activeUrl : null}
+      splatFormat={
+        renderMode === "3dgs"
+          ? ((activeFormat as SplatFormat | null) ?? "ply")
+          : null
+      }
+      positions={positions}
+      pointSize={pointSize}
+      trajPoints={traj?.points ?? []}
+      offset={offset}
+      yawDeg={yawDeg}
+      playIndex={playIndex}
+      setOffset={setOffset}
+      onSplatLoadingChange={setSplatLoading}
+      onSplatError={setSplatError}
+    />,
+  );
+
   return (
     <div
-      style={{
-        width: "100%",
-        height: "100%",
-        position: "relative",
-        background: "#0b0b12",
-      }}
+      className="mode-overlay"
+      style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
     >
-      <Canvas onContextMenu={(e) => e.preventDefault()} dpr={[1, 2]}>
-        <TrajScene
-          renderMode={renderMode}
-          sceneFile={sceneFile}
-          positions={positions}
-          pointSize={pointSize}
-          trajPoints={traj?.points ?? []}
-          offset={offset}
-          yawDeg={yawDeg}
-          playIndex={playIndex}
-          setOffset={setOffset}
-          onSplatLoadingChange={setSplatLoading}
-        />
-      </Canvas>
-
       {/* Unified left-side scene column shared by all three modes: render
           mode and cloud/splat selection on top, then this
           mode's visualization lists (trajectory path/step browser and the
@@ -371,14 +335,17 @@ export function TrajectoryMode() {
         <SceneAssetPanel
           renderMode={renderMode}
           onRenderModeChange={setRenderMode}
-          cloudFiles={cloudFileList}
-          selectedCloud={sceneFile}
-          onSelectCloud={setSceneFile}
-          splatFiles={splatFileList}
-          selectedSplat={sceneFile}
-          onSelectSplat={(name) => setSceneFile(name ?? "")}
-          loading={sceneLoading}
-          error={sceneError}
+          scenes={scenes}
+          selectedScene={scene}
+          onSelectScene={selectScene}
+          cloudFiles={cloudFiles}
+          selectedCloud={selectedCloud}
+          onSelectCloud={selectCloud}
+          splatFiles={splatFiles}
+          selectedSplat={selectedSplat}
+          onSelectSplat={selectSplat}
+          loading={renderMode === "pointcloud" ? cloudLoading : splatLoading}
+          error={renderMode === "pointcloud" ? cloudError : splatError}
         >
           {renderMode === "pointcloud" && (
             <PanelSlider
@@ -516,7 +483,9 @@ export function TrajectoryMode() {
 
 interface TrajSceneProps {
   renderMode: RenderMode;
-  sceneFile: string;
+  /** Splat asset to render in 3DGS mode (null = none / pointcloud mode). */
+  splatSrc: string | null;
+  splatFormat: SplatFormat | null;
   positions: Float32Array | null;
   pointSize: number;
   trajPoints: TrajPoint[];
@@ -525,6 +494,7 @@ interface TrajSceneProps {
   playIndex: number;
   setOffset: (o: [number, number, number]) => void;
   onSplatLoadingChange: (loading: boolean) => void;
+  onSplatError: (message: string | null) => void;
 }
 
 function TrajScene(p: TrajSceneProps) {
@@ -710,18 +680,14 @@ function TrajScene(p: TrajSceneProps) {
             opacity={0.85}
           />
         )}
-        {p.renderMode === "3dgs" &&
-          (() => {
-            const fmt = splatFormatOf(p.sceneFile);
-            if (!fmt) return null;
-            return (
-              <GaussianSplatLayer
-                src={`/api/pcd?name=${encodeURIComponent(p.sceneFile)}`}
-                format={fmt}
-                onLoadingChange={p.onSplatLoadingChange}
-              />
-            );
-          })()}
+        {p.renderMode === "3dgs" && p.splatSrc && p.splatFormat && (
+          <GaussianSplatLayer
+            src={p.splatSrc}
+            format={p.splatFormat}
+            onLoadingChange={p.onSplatLoadingChange}
+            onError={p.onSplatError}
+          />
+        )}
         {p.trajPoints.length > 0 && (
           <TrajectoryLine
             points={p.trajPoints}
