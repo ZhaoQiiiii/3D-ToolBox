@@ -18,6 +18,8 @@ import { type SplatFormat } from "../../shared/splat-format";
 import { createLocalStorageHook } from "../../shared/use-local-storage";
 import { useSceneAssets } from "../../shared/use-scene-assets";
 import { useCanvasSlot } from "../../shared/canvas-slot";
+import { useSceneCameraPose } from "../../shared/use-scene-camera";
+import { useSceneVisuals } from "../../shared/use-scene-visuals";
 import {
   Y_UP,
   rayHitHorizontalPlane,
@@ -121,7 +123,8 @@ export function TrajectoryMode() {
     cloudLoading,
     cloudError,
   } = useSceneAssets(SCENE_PCD_MAX_POINTS);
-  const [pointSize, setPointSize] = useLocalStorageState("pointSize", 0.02);
+  // Scene point size: the ONE shared setting across all three modes.
+  const { pointSize, setPointSize } = useSceneVisuals();
   const [splatLoading, setSplatLoading] = useState(false);
   const [splatError, setSplatError] = useState<string | null>(null);
 
@@ -503,6 +506,8 @@ function TrajScene(p: TrajSceneProps) {
     | { enabled: boolean }
     | null;
   const gl = useThree((s) => s.gl);
+  // ONE camera pose across all three modes: restore on mount, track live.
+  useSceneCameraPose();
   const sceneGroupRef = useRef<THREE.Group>(null);
   const raycaster = useMemo(() => new THREE.Raycaster(), []);
   const ndc = useMemo(() => new THREE.Vector2(), []);

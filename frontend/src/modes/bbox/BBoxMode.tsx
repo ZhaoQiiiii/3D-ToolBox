@@ -31,6 +31,8 @@ import {
 import { createLocalStorageHook } from "../../shared/use-local-storage";
 import { useSceneAssets } from "../../shared/use-scene-assets";
 import { useCanvasSlot } from "../../shared/canvas-slot";
+import { useSceneCameraPose } from "../../shared/use-scene-camera";
+import { useSceneVisuals } from "../../shared/use-scene-visuals";
 import { isUndoShortcut } from "../../shared/shortcuts";
 import {
   Y_UP,
@@ -470,9 +472,11 @@ function Scene({
 }) {
   const sceneGroupRef = useRef<THREE.Group>(null);
   const controlsRef = useRef<any>(null);
-  const pointsRef = useRef<THREE.Points>(null);
+  const pointsRef = useRef<THREE.Points | null>(null);
   const splatViewerRef = useRef<DropInViewer | null>(null);
   const dragRefs = useRef<DragEntry[]>([]);
+  // ONE camera pose across all three modes: restore on mount, track live.
+  useSceneCameraPose();
 
   // While placing a new box, right-drag on empty space must not pan the camera
   // (right button is reserved for vertical corner drags).
@@ -563,7 +567,8 @@ function Scene({
 const useLocalStorageState = createLocalStorageHook("3dbbox_");
 
 export function BBoxMode() {
-  const [pointSize, setPointSize] = useLocalStorageState<number>("pointSize", 0.06);
+  // Scene point size: the ONE shared setting across all three modes.
+  const { pointSize, setPointSize } = useSceneVisuals();
   const [handleRadius, setHandleRadius] = useLocalStorageState<number>("handleRadius", 0.12);
   const [lineWidth, setLineWidth] = useLocalStorageState<number>("lineWidth", 0.04);
   const [opacity, setOpacity] = useLocalStorageState<number>("opacity", 0.08);

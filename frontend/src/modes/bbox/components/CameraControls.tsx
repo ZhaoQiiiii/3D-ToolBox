@@ -9,6 +9,7 @@ export const CameraControls = forwardRef<any>(function CameraControls(_props, re
   return (
     <OrbitControls
       ref={ref}
+      makeDefault
       enableDamping
       dampingFactor={0.1}
       maxDistance={400}

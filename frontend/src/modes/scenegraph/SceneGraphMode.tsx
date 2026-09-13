@@ -33,6 +33,8 @@ import { type SplatFormat } from "../../shared/splat-format";
 import { createLocalStorageHook } from "../../shared/use-local-storage";
 import { useSceneAssets } from "../../shared/use-scene-assets";
 import { useCanvasSlot } from "../../shared/canvas-slot";
+import { useSceneCameraPose } from "../../shared/use-scene-camera";
+import { useSceneVisuals } from "../../shared/use-scene-visuals";
 import { loadSceneGraph } from "./lib/scene-loader";
 import { logEvent } from "./lib/logger";
 import { pickTarget } from "./lib/picking";
@@ -1124,6 +1126,8 @@ function Scene({
 }) {
   const sceneGroupRef = useRef<THREE.Group>(null);
   const controlsRef = useRef<any>(null);
+  // ONE camera pose across all three modes: restore on mount, track live.
+  useSceneCameraPose();
   const [hoverTarget, setHoverTarget] = useState<PickTarget>(null);
   const handleHoverTarget = useCallback((target: PickTarget) => {
     setHoverTarget((current) => {
@@ -1270,6 +1274,7 @@ function Scene({
       <gridHelper args={[80, 80, "#333", "#222"]} />
       <OrbitControls
         ref={controlsRef}
+        makeDefault
         enableDamping
         dampingFactor={0.1}
         enableZoom={false}
@@ -1401,7 +1406,8 @@ export function SceneGraphMode() {
   const [objectSize, setObjectSize] = useLocalStorageState("disp_objSize_v2", 0.02);
   const [objectLineThickness, setObjectLineThickness] = useLocalStorageState("disp_objLine_v2", 0.01);
   const [pcdColorScheme, setPcdColorScheme] = useLocalStorageState<PcdColorScheme>("disp_pcdScheme", "flat");
-  const [pcdPointSize, setPcdPointSize] = useLocalStorageState("disp_pcdPtSize", 0.06);
+  // Scene point size: the ONE shared setting across all three modes.
+  const { pointSize: pcdPointSize, setPointSize: setPcdPointSize } = useSceneVisuals();
 
   // Selection filter
   const [selectableKinds, setSelectableKinds] = useState<Set<PickKind>>(
