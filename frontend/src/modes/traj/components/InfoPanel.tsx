@@ -34,6 +34,7 @@ const LABEL: CSSProperties = {
 };
 
 interface Props {
+  scene: string;
   step: TrajStep;
   prompt: PromptInfo | null;
   result: ResultInfo | null;
@@ -50,6 +51,7 @@ interface Props {
  * to the playhead frame) and the current point readout.
  */
 export function InfoPanel({
+  scene,
   step,
   prompt,
   result,
@@ -60,7 +62,7 @@ export function InfoPanel({
   currentPoint,
 }: Props) {
   const assetUrl = (name: string) =>
-    `/api/traj-asset?path=${encodeURIComponent(step.path)}&name=${name}`;
+    `/api/traj-asset?scene=${encodeURIComponent(scene)}&path=${encodeURIComponent(step.path)}&name=${name}`;
 
   return (
     <div data-overlay style={PANEL}>

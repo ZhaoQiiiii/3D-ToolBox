@@ -27,14 +27,15 @@
  * - POST /api/log                                      → client-side event sink
  *
  * ── Trajectory visualization mode ────────────────────────────────────
- * Browsing is fixed to trajectories/ (TRAJ_ROOT): the UI walks worldmodel
- * flight_…/step_… directories under it. Everything is strictly read-only;
- * only whitelisted well-known artifact names can be read out of a step dir,
- * and every requested path must stay inside TRAJ_ROOT.
+ * Browsing is per-scene, rooted at scenes/<scene>/trajectories/: the UI
+ * walks worldmodel flight_…/step_… directories under it. Everything is
+ * strictly read-only; only whitelisted well-known artifact names can be read
+ * out of a step dir, and every requested path must stay inside the scene's
+ * trajectory root.
  *
- * - GET  /api/traj-browse?path=…  → smart listing (step/flight/dir levels)
- * - GET  /api/traj-file?path=…&name=…    → whitelisted step JSON artifacts
- * - GET  /api/traj-asset?path=…&name=…   → anchor.jpg / video.mp4 (Range-capable)
+ * - GET  /api/traj-browse?scene=…&path=…  → smart listing (step/flight/dir)
+ * - GET  /api/traj-file?scene=…&path=…&name=…   → whitelisted step JSON artifacts
+ * - GET  /api/traj-asset?scene=…&path=…&name=…  → anchor.jpg / video.mp4 (Range)
  *
  * Route split for /api/pcd: SceneGraph-mode requests always carry `snapshot`
  * or `source`; a plain `?name=` belongs to the BBox/Trajectory modes. The
@@ -184,8 +185,8 @@ const TRAJ_ASSET_TYPES: Record<string, string> = {
 
 /**
  * Validate a trajectory directory path: must be absolute, free of NUL bytes
- * and — after resolving `..` — inside the fixed TRAJ_ROOT. Browsing anywhere
- * else on the server is rejected.
+ * and — after resolving `..` — inside the given scene's trajectory root.
+ * Browsing anywhere else on the server is rejected.
  */
 function trajPathWithin(root: string, p: unknown): p is string {
   if (
@@ -1240,9 +1241,12 @@ export function apiPlugin(): Plugin {
   // folder under the project.
   const SCENES_ROOT = join(PROJECT_ROOT, "scenes");
 
-  // Fixed trajectory browsing root: worldmodel flight_/step_ directories are
-  // only ever read from inside trajectories/.
-  const TRAJ_ROOT = join(PROJECT_ROOT, "trajectories");
+  // Trajectory browsing is per-scene: worldmodel flight_/step_ directories
+  // live under scenes/<scene>/trajectories/. The `scene` param selects the root.
+  const trajRootOf = (scene: unknown): string | null => {
+    if (!isValidSceneName(scene)) return null;
+    return join(SCENES_ROOT, scene, "trajectories");
+  };
 
   // Initialize the log directory on plugin setup. Each `bun run dev` restart
   // gets its own timestamped file: logs/YYYY-MM-DD_HH-MM-SS.log
@@ -1749,11 +1753,11 @@ export function apiPlugin(): Plugin {
 
       // ---- Trajectory mode: read-only browsing of worldmodel flight/step dirs ----
       //
-      // GET /api/traj-browse?path=<abs server path>
+      // GET /api/traj-browse?scene=<scene>&path=<abs server path>
       //   Smart listing: a step_* dir → itself; a flight_* dir → its steps;
       //   any other dir → the flight_*/step_* entries directly inside.
-      // GET /api/traj-file?path=<step dir>&name=<whitelisted json>
-      // GET /api/traj-asset?path=<step dir>&name=(anchor.jpg|video.mp4)
+      // GET /api/traj-file?scene=<scene>&path=<step dir>&name=<whitelisted json>
+      // GET /api/traj-asset?scene=<scene>&path=<step dir>&name=(anchor.jpg|video.mp4)
       //   Binary stream with Range support (video scrubbing).
 
       server.middlewares.use(
@@ -1768,12 +1772,17 @@ export function apiPlugin(): Plugin {
               req.url || "",
               `http://${req.headers.host || "localhost"}`,
             );
-            // No `path` param → the fixed root (the UI starts there).
-            const raw = url.searchParams.get("path") ?? TRAJ_ROOT;
-            if (!trajPathWithin(TRAJ_ROOT, raw)) {
+            const trajRoot = trajRootOf(url.searchParams.get("scene"));
+            if (!trajRoot) {
+              sendJson(res, 400, { success: false, error: "Missing/invalid scene" });
+              return;
+            }
+            // No `path` param → the scene's trajectory root (the UI starts there).
+            const raw = url.searchParams.get("path") ?? trajRoot;
+            if (!trajPathWithin(trajRoot, raw)) {
               sendJson(res, 400, {
                 success: false,
-                error: "Path must stay inside the project directory",
+                error: "Path must stay inside the scene's trajectory root",
               });
               return;
             }
@@ -1791,7 +1800,7 @@ export function apiPlugin(): Plugin {
 
             const base = basename(raw);
             if (base.startsWith("step_")) {
-              sendJson(res, 200, { kind: "step", path: raw, root: TRAJ_ROOT, step: trajStepInfo(raw) });
+              sendJson(res, 200, { kind: "step", path: raw, root: trajRoot, step: trajStepInfo(raw) });
               return;
             }
 
@@ -1806,7 +1815,7 @@ export function apiPlugin(): Plugin {
               sendJson(res, 200, {
                 kind: "flight",
                 path: raw,
-                root: TRAJ_ROOT,
+                root: trajRoot,
                 steps: entries
                   .filter((n) => n.startsWith("step_"))
                   .map((n) => trajStepInfo(join(raw, n))),
@@ -1816,7 +1825,7 @@ export function apiPlugin(): Plugin {
             sendJson(res, 200, {
               kind: "dir",
               path: raw,
-              root: TRAJ_ROOT,
+              root: trajRoot,
               flights: entries
                 .filter((n) => n.startsWith("flight_"))
                 .map((n) => ({ name: n, path: join(raw, n) })),
@@ -1844,8 +1853,17 @@ export function apiPlugin(): Plugin {
             );
             const dir = url.searchParams.get("path");
             const name = url.searchParams.get("name");
-            if (!trajPathWithin(TRAJ_ROOT, dir) || !name || !TRAJ_JSON_FILES.has(name)) {
-              sendJson(res, 400, { success: false, error: "Invalid path or file name" });
+            const trajRoot = trajRootOf(url.searchParams.get("scene"));
+            if (
+              !trajRoot ||
+              !trajPathWithin(trajRoot, dir) ||
+              !name ||
+              !TRAJ_JSON_FILES.has(name)
+            ) {
+              sendJson(res, 400, {
+                success: false,
+                error: "Invalid scene, path or file name",
+              });
               return;
             }
             const filePath = join(dir, name);
@@ -1882,8 +1900,12 @@ export function apiPlugin(): Plugin {
             const dir = url.searchParams.get("path");
             const name = url.searchParams.get("name");
             const contentType = name ? TRAJ_ASSET_TYPES[name] : undefined;
-            if (!trajPathWithin(TRAJ_ROOT, dir) || !contentType) {
-              sendJson(res, 400, { success: false, error: "Invalid path or asset name" });
+            const trajRoot = trajRootOf(url.searchParams.get("scene"));
+            if (!trajRoot || !trajPathWithin(trajRoot, dir) || !contentType) {
+              sendJson(res, 400, {
+                success: false,
+                error: "Invalid scene, path or asset name",
+              });
               return;
             }
             streamTrajAsset(res, join(dir, name), contentType, req.headers.range);

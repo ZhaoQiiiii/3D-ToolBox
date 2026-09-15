@@ -142,8 +142,12 @@ export function TrajectoryMode() {
   // Monotonic token for browse requests (see doBrowse).
   const browseSeqRef = useRef(0);
 
-  const doBrowse = useCallback(async (path?: string) => {
+  const doBrowse = useCallback(async (path?: string, sceneName?: string) => {
     const trimmed = path?.trim() ?? "";
+    const targetScene = sceneName?.trim() ?? "";
+    // The trajectory root lives under a concrete scene, so browsing is
+    // impossible until the scene bucket has resolved.
+    if (!targetScene) return;
     // Sequence token: a newer browse supersedes an in-flight one, so a
     // slow older response can never overwrite the newer listing.
     const seq = ++browseSeqRef.current;
@@ -152,11 +156,9 @@ export function TrajectoryMode() {
     // The previous step's load error is stale once the user browses away.
     setTrajError(null);
     try {
-      const resp = await fetch(
-        trimmed
-          ? `/api/traj-browse?path=${encodeURIComponent(trimmed)}`
-          : "/api/traj-browse",
-      );
+      const params = new URLSearchParams({ scene: targetScene });
+      if (trimmed) params.set("path", trimmed);
+      const resp = await fetch(`/api/traj-browse?${params.toString()}`);
       if (!resp.ok) {
         const j = (await resp.json().catch(() => null)) as
           | { error?: string }
@@ -177,11 +179,11 @@ export function TrajectoryMode() {
     }
   }, []);
 
-  // Auto-browse the fixed root on mount.
+  // Auto-browse the active scene's trajectory root: once on scene resolution,
+  // then again whenever the shared scene selection changes.
   useEffect(() => {
-    void doBrowse();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (scene) void doBrowse(undefined, scene);
+  }, [scene, doBrowse]);
 
   // Load step artifacts (trajectory + metadata) with a cancellation guard:
   // rapidly switching steps must not let a stale fetch clobber the new one.
@@ -199,7 +201,7 @@ export function TrajectoryMode() {
     let cancelled = false;
     setTrajLoading(true);
     setTrajError(null);
-    const base = `/api/traj-file?path=${encodeURIComponent(selectedStep.path)}&name=`;
+    const base = `/api/traj-file?scene=${encodeURIComponent(scene)}&path=${encodeURIComponent(selectedStep.path)}&name=`;
     (async () => {
       try {
         const [trajResp, promptResp, resultResp] = await Promise.all([
@@ -256,7 +258,7 @@ export function TrajectoryMode() {
     return () => {
       cancelled = true;
     };
-  }, [selectedStep]);
+  }, [selectedStep, scene]);
 
   // Playback: advance the playhead; stop at the last point. setPlaying runs
   // in its own effect below — calling it inside the setPlayIndex updater
@@ -377,7 +379,7 @@ export function TrajectoryMode() {
           selectedStep={selectedStep}
           onSelectStep={(s) => setSelectedStep(s)}
           onNavigate={(path) => {
-            void doBrowse(path);
+            void doBrowse(path, scene);
           }}
           offset={offset}
           yawDeg={yawDeg}
@@ -394,6 +396,7 @@ export function TrajectoryMode() {
 
         {selectedStep && (
           <InfoPanel
+            scene={scene}
             step={selectedStep}
             prompt={prompt}
             result={result}

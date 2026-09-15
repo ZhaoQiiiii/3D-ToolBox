@@ -470,7 +470,11 @@ export function PanelSlider({
   };
 
   const stepBy = (delta: number) => {
-    onChange(roundTo(clamp(value + delta), decimals));
+    const v = roundTo(clamp(value + delta), decimals);
+    onChange(v);
+    // Keep the draft in sync even while focused: without this, blur()
+    // commits the stale draft and silently undoes this step.
+    setDraft(v.toFixed(decimals));
   };
 
   return (

@@ -22,13 +22,9 @@ logs/
 *.log
 
 # Scene data (per-scene buckets: point clouds / splats / bboxes /
-# scene_graph_{saved,exported} — keep only the dir placeholder)
+# scene_graph_{saved,exported} / trajectories — keep only the dir placeholder)
 scenes/*
 !scenes/.gitkeep
-
-# Trajectory data (worldmodel flight_*/step_* dirs — large, keep placeholder only)
-trajectories/*
-!trajectories/.gitkeep
 
 # IDE local config (TRAE)
 .trae/
