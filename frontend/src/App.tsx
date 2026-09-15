@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useState } from "react";
 import type { CSSProperties } from "react";
 import { Canvas } from "@react-three/fiber";
 import { CanvasSlot } from "./shared/canvas-slot";
@@ -53,12 +53,34 @@ function loadStoredMode(): AppMode {
  */
 export function App() {
   const [mode, setMode] = useState<AppMode>(loadStoredMode);
+  // True while a mode switch is in flight — shown as a centered "Loading..."
+  // overlay so every switch has explicit feedback (the lazy chunks may
+  // already be cached, so the Suspense fallback alone would not always
+  // appear; the canvas is also shared, making the switch near-instant).
+  const [switching, setSwitching] = useState(false);
+
+  const switchMode = useCallback(
+    (id: AppMode) => {
+      if (id === mode) return;
+      setSwitching(true);
+      setMode(id);
+    },
+    [mode],
+  );
 
   useEffect(() => {
     try {
       localStorage.setItem("3dbbox_appMode", mode);
     } catch {}
   }, [mode]);
+
+  // Clear the switch indicator shortly after the new mode mounts, giving the
+  // overlay a perceptible presence even for instant switches.
+  useEffect(() => {
+    if (!switching) return;
+    const t = setTimeout(() => setSwitching(false), 250);
+    return () => clearTimeout(t);
+  }, [switching, mode]);
 
   return (
     <div style={{ width: "100%", height: "100%", position: "relative", background: "#0b0b12" }}>
@@ -78,7 +100,7 @@ export function App() {
           <button
             key={id}
             style={id === mode ? activeBtnStyle : btnStyle}
-            onClick={() => setMode(id)}
+            onClick={() => switchMode(id)}
             title={`切换到${label}模式`}
           >
             {label}
@@ -86,7 +108,7 @@ export function App() {
         ))}
       </div>
 
-      <Suspense fallback={<div style={fallbackStyle}>Loading…</div>}>
+      <Suspense fallback={<div style={loadingOverlayStyle}>Loading...</div>}>
         {mode === "bbox" ? (
           <BBoxMode />
         ) : mode === "scenegraph" ? (
@@ -95,6 +117,8 @@ export function App() {
           <TrajectoryMode />
         )}
       </Suspense>
+
+      {switching && <div style={loadingOverlayStyle}>Loading...</div>}
     </div>
   );
 }
@@ -138,13 +162,18 @@ const activeBtnStyle: CSSProperties = {
   fontWeight: 600,
 };
 
-const fallbackStyle: CSSProperties = {
+const loadingOverlayStyle: CSSProperties = {
   position: "absolute",
   top: "50%",
   left: "50%",
   transform: "translate(-50%,-50%)",
-  color: "#ccc",
+  zIndex: 50,
+  background: "rgba(10,12,24,0.9)",
+  color: "#3498db",
   fontFamily: "monospace",
   fontSize: 14,
+  padding: "10px 22px",
+  borderRadius: 8,
+  border: "1px solid rgba(52,152,219,0.4)",
   pointerEvents: "none",
 };

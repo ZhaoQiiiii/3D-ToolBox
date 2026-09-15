@@ -103,8 +103,9 @@ function getViewer(
     cache.delete(key);
     try {
       // The typings don't expose DropInViewer.dispose(); the internal
-      // viewer has the same async teardown (see the error-eviction path).
-      void existing.viewer.viewer.dispose().catch(() => undefined);
+      // Viewer's teardown is synchronous (verified against the library
+      // source) — do NOT chain .catch on it (undefined.catch would throw).
+      existing.viewer.viewer.dispose();
     } catch {
       /* teardown may throw for a dead-context viewer; ignore */
     }
@@ -187,7 +188,8 @@ export function GaussianSplatLayer({
         if (cache.get(key) === entry) {
           cache.delete(key);
           try {
-            void entry.viewer.viewer.dispose().catch(() => undefined);
+            // Synchronous teardown (see the renderer-mismatch eviction).
+            entry.viewer.viewer.dispose();
           } catch {
             /* teardown may throw during in-flight download; ignore */
           }

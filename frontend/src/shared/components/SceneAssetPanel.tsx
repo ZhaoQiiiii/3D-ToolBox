@@ -1,4 +1,6 @@
+import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
+import { SCHEME_LABELS, type PcdColorScheme } from "./PointCloudLayer";
 
 export type SceneRenderMode = "pointcloud" | "3dgs";
 
@@ -124,6 +126,24 @@ interface Props {
 
   loading?: boolean;
   error?: string | null;
+  /**
+   * 点云大小 — 三模式共用的场景可视化参数，只在「点云」渲染模式下显示。
+   * 由 useSceneVisuals 提供（跨模式共享、跨会话持久化）。
+   */
+  pointSize?: number;
+  onPointSizeChange?: (v: number) => void;
+  /**
+   * 栅格尺度与坐标系显示 — 三模式共用的场景可视化参数，两种渲染模式
+   * 下都可见。由 useSceneVisuals 提供（跨模式共享、跨会话持久化）。
+   */
+  gridSize?: number;
+  onGridSizeChange?: (v: number) => void;
+  showAxes?: boolean;
+  onShowAxesChange?: (v: boolean) => void;
+  colorScheme?: PcdColorScheme;
+  onColorSchemeChange?: (v: PcdColorScheme) => void;
+  opacity?: number;
+  onOpacityChange?: (v: number) => void;
   /** Mode-specific visualization parameters, rendered below the selectors. */
   children?: ReactNode;
 }
@@ -148,6 +168,16 @@ export function SceneAssetPanel({
   onSelectSplat,
   loading = false,
   error = null,
+  pointSize,
+  onPointSizeChange,
+  gridSize,
+  onGridSizeChange,
+  showAxes,
+  onShowAxesChange,
+  colorScheme,
+  onColorSchemeChange,
+  opacity,
+  onOpacityChange,
   children = null,
 }: Props) {
   // Keep a valid selection visible even when the active file is not part of
@@ -241,7 +271,7 @@ export function SceneAssetPanel({
 
       {loading && (
         <div style={{ color: "#8ab4d8", marginTop: 6, fontSize: 12 }}>
-          加载中…
+          Loading...
         </div>
       )}
       {error && (
@@ -256,6 +286,110 @@ export function SceneAssetPanel({
           {error}
         </div>
       )}
+
+      {(gridSize !== undefined && onGridSizeChange) ||
+      (showAxes !== undefined && onShowAxesChange) ? (
+        <div
+          style={{
+            marginTop: 10,
+            borderTop: "1px solid rgba(52,152,219,0.25)",
+            paddingTop: 8,
+          }}
+        >
+          {gridSize !== undefined && onGridSizeChange && (
+            <PanelSlider
+              label="栅格尺度"
+              value={gridSize}
+              min={20}
+              max={200}
+              step={10}
+              onChange={onGridSizeChange}
+              decimals={0}
+            />
+          )}
+          {showAxes !== undefined && onShowAxesChange && (
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                marginTop: 8,
+                cursor: "pointer",
+                fontSize: 13,
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={showAxes}
+                onChange={(e) => onShowAxesChange(e.target.checked)}
+                style={{ accentColor: "#3498db" }}
+              />
+              <span>坐标系</span>
+            </label>
+          )}
+        </div>
+      ) : null}
+
+      {renderMode === "pointcloud" &&
+        ((pointSize !== undefined && onPointSizeChange) ||
+          (colorScheme !== undefined && onColorSchemeChange) ||
+          (opacity !== undefined && onOpacityChange)) && (
+          <div
+            style={{
+              marginTop: 10,
+              borderTop: "1px solid rgba(52,152,219,0.25)",
+              paddingTop: 8,
+            }}
+          >
+            {pointSize !== undefined && onPointSizeChange && (
+              <PanelSlider
+                label="点大小"
+                value={pointSize}
+                min={0.01}
+                max={0.3}
+                step={0.01}
+                onChange={onPointSizeChange}
+              />
+            )}
+            {opacity !== undefined && onOpacityChange && (
+              <PanelSlider
+                label="不透明度"
+                value={opacity}
+                min={0.05}
+                max={1}
+                step={0.05}
+                onChange={onOpacityChange}
+                decimals={2}
+              />
+            )}
+            {colorScheme !== undefined && onColorSchemeChange && (
+              <div style={{ marginTop: 8 }}>
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: "#8ab4d8",
+                    marginBottom: 2,
+                  }}
+                >
+                  配色方案
+                </div>
+                <select
+                  value={colorScheme}
+                  onChange={(e) =>
+                    onColorSchemeChange(e.target.value as PcdColorScheme)
+                  }
+                  style={{ ...selectStyle, padding: "3px 6px", fontSize: 12 }}
+                >
+                  {Object.entries(SCHEME_LABELS).map(([k, v]) => (
+                    <option key={k} value={k}>
+                      {v}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </div>
+        )}
 
       {children && (
         <div
@@ -273,9 +407,31 @@ export function SceneAssetPanel({
 }
 
 /**
- * Label + value + range row used for the per-mode visualization parameters
- * shown under the scene selectors (BBox sizes, Trajectory point size, …).
+ * Label + value + stepper row for per-mode visualization parameters, styled
+ * to match BBoxPanel's NumberStepper (numeric input + ▲/▼ buttons).
  */
+const STEPPER_BTN_STYLE: CSSProperties = {
+  width: 28,
+  height: 28,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  background: "#1a1a2e",
+  color: "#3498db",
+  border: "1px solid #3498db",
+  borderRadius: 4,
+  cursor: "pointer",
+  fontSize: 12,
+  lineHeight: 1,
+  padding: 0,
+  flexShrink: 0,
+};
+
+function roundTo(n: number, decimals: number) {
+  const f = Math.pow(10, decimals);
+  return Math.round(n * f) / f;
+}
+
 export function PanelSlider({
   label,
   value,
@@ -293,6 +449,30 @@ export function PanelSlider({
   onChange: (v: number) => void;
   decimals?: number;
 }) {
+  const [draft, setDraft] = useState(value.toFixed(decimals));
+  const focusedRef = useRef(false);
+
+  useEffect(() => {
+    if (!focusedRef.current) setDraft(value.toFixed(decimals));
+  }, [value, decimals]);
+
+  const clamp = (n: number) => Math.min(max, Math.max(min, n));
+
+  const commit = (raw: string) => {
+    const n = Number(raw);
+    if (Number.isFinite(n)) {
+      const v = roundTo(clamp(n), decimals);
+      onChange(v);
+      setDraft(v.toFixed(decimals));
+    } else {
+      setDraft(value.toFixed(decimals));
+    }
+  };
+
+  const stepBy = (delta: number) => {
+    onChange(roundTo(clamp(value + delta), decimals));
+  };
+
   return (
     <div style={{ marginTop: 4 }}>
       <div
@@ -305,22 +485,58 @@ export function PanelSlider({
         }}
       >
         <span>{label}</span>
-        <span style={{ color: "#ddd" }}>{value.toFixed(decimals)}</span>
       </div>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-        style={{
-          width: "100%",
-          accentColor: "#3498db",
-          height: 4,
-          cursor: "pointer",
-        }}
-      />
+      <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: 2 }}>
+        <input
+          className="panel-stepper-input"
+          type="number"
+          step={step}
+          min={min}
+          max={max}
+          value={draft}
+          onFocus={() => {
+            focusedRef.current = true;
+          }}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={() => {
+            focusedRef.current = false;
+            commit(draft);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+          }}
+          style={{
+            flex: 1,
+            height: 28,
+            background: "#1a1a2e",
+            color: "#eee",
+            border: "1px solid #3498db",
+            borderRadius: 4,
+            padding: "2px 6px",
+            fontFamily: "monospace",
+            fontSize: 13,
+            textAlign: "right",
+          }}
+        />
+        <button
+          type="button"
+          aria-label="increase"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => stepBy(step)}
+          style={STEPPER_BTN_STYLE}
+        >
+          ▲
+        </button>
+        <button
+          type="button"
+          aria-label="decrease"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => stepBy(-step)}
+          style={STEPPER_BTN_STYLE}
+        >
+          ▼
+        </button>
+      </div>
     </div>
   );
 }

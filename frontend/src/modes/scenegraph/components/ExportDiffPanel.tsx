@@ -6,7 +6,7 @@ import { loadSceneGraph } from "../lib/scene-loader";
 import type { SceneData } from "../lib/types";
 import { TopologicalNodes } from "./TopologicalNodes";
 import { TopologicalEdges } from "./TopologicalEdges";
-import { WorldAxes } from "./WorldAxes";
+import { WorldAxes } from "../../../shared/components/WorldAxes";
 
 interface Props {
   scene: string;
@@ -118,7 +118,7 @@ export function ExportDiffPanel({ scene, snapshot, onClose }: Props) {
     return (
       <div style={overlayStyle}>
         <div style={{ color: "#888", fontFamily: "monospace", fontSize: 14 }}>
-          Loading data...
+          Loading...
         </div>
       </div>
     );

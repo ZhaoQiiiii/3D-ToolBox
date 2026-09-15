@@ -8,14 +8,14 @@ import { TrajectoryLine } from "./components/TrajectoryLine";
 import { ControlPanel } from "./components/ControlPanel";
 import { InfoPanel } from "./components/InfoPanel";
 import { GaussianSplatLayer } from "../../shared/components/GaussianSplatLayer";
-import { PointCloudLayer } from "../../shared/components/PointCloudLayer";
+import { PointCloudLayer, type PcdColorScheme } from "../../shared/components/PointCloudLayer";
+import { WorldAxes } from "../../shared/components/WorldAxes";
+import { SceneGrid } from "../../shared/components/SceneGrid";
 import {
-  PanelSlider,
   SCENE_COLUMN_STYLE,
   SceneAssetPanel,
 } from "../../shared/components/SceneAssetPanel";
 import { type SplatFormat } from "../../shared/splat-format";
-import { createLocalStorageHook } from "../../shared/use-local-storage";
 import { useSceneAssets } from "../../shared/use-scene-assets";
 import { useCanvasSlot } from "../../shared/canvas-slot";
 import { useSceneCameraPose } from "../../shared/use-scene-camera";
@@ -33,13 +33,6 @@ import type {
   TrajStep,
   TrajectoryData,
 } from "./lib/traj-types";
-
-// Persistence prefix for Trajectory-mode display parameters. Must stay
-// byte-identical or already saved settings silently reset.
-const useLocalStorageState = createLocalStorageHook("traj_");
-
-// Cap the parsed scene cloud for responsiveness (matches the other modes).
-const SCENE_PCD_MAX_POINTS = 2_000_000;
 
 type RenderMode = "pointcloud" | "3dgs";
 
@@ -122,9 +115,20 @@ export function TrajectoryMode() {
     positions,
     cloudLoading,
     cloudError,
-  } = useSceneAssets(SCENE_PCD_MAX_POINTS);
+  } = useSceneAssets();
   // Scene point size: the ONE shared setting across all three modes.
-  const { pointSize, setPointSize } = useSceneVisuals();
+  const {
+    pointSize,
+    setPointSize,
+    gridSize,
+    setGridSize,
+    showAxes,
+    setShowAxes,
+    colorScheme,
+    setColorScheme,
+    opacity,
+    setOpacity,
+  } = useSceneVisuals();
   const [splatLoading, setSplatLoading] = useState(false);
   const [splatError, setSplatError] = useState<string | null>(null);
 
@@ -314,6 +318,10 @@ export function TrajectoryMode() {
       }
       positions={positions}
       pointSize={pointSize}
+      gridSize={gridSize}
+      showAxes={showAxes}
+      colorScheme={colorScheme}
+      cloudOpacity={opacity}
       trajPoints={traj?.points ?? []}
       offset={offset}
       yawDeg={yawDeg}
@@ -349,19 +357,17 @@ export function TrajectoryMode() {
           onSelectSplat={selectSplat}
           loading={renderMode === "pointcloud" ? cloudLoading : splatLoading}
           error={renderMode === "pointcloud" ? cloudError : splatError}
-        >
-          {renderMode === "pointcloud" && (
-            <PanelSlider
-              label="点大小"
-              value={pointSize}
-              min={0.002}
-              max={0.1}
-              step={0.002}
-              onChange={setPointSize}
-              decimals={3}
-            />
-          )}
-        </SceneAssetPanel>
+          pointSize={pointSize}
+          onPointSizeChange={setPointSize}
+          gridSize={gridSize}
+          onGridSizeChange={setGridSize}
+          showAxes={showAxes}
+          onShowAxesChange={setShowAxes}
+          colorScheme={colorScheme}
+          onColorSchemeChange={setColorScheme}
+          opacity={opacity}
+          onOpacityChange={setOpacity}
+        />
 
         <ControlPanel
           rootPath={rootPath}
@@ -453,7 +459,7 @@ export function TrajectoryMode() {
             fontSize: 12,
           }}
         >
-          {trajError ? `轨迹加载失败: ${trajError}` : "轨迹加载中…"}
+          {trajError ? `轨迹加载失败: ${trajError}` : "Loading..."}
         </div>
       )}
 
@@ -465,17 +471,13 @@ export function TrajectoryMode() {
             top: "50%",
             left: "50%",
             transform: "translate(-50%,-50%)",
-            background: "rgba(0,0,0,0.75)",
-            borderRadius: 8,
-            padding: "12px 20px",
-            color: "#fff",
-            fontSize: 14,
+            color: "#666",
             fontFamily: "monospace",
+            fontSize: 14,
             pointerEvents: "none",
-            zIndex: 5,
           }}
         >
-          正在渲染 3DGS…
+          Loading...
         </div>
       )}
     </div>
@@ -491,6 +493,10 @@ interface TrajSceneProps {
   splatFormat: SplatFormat | null;
   positions: Float32Array | null;
   pointSize: number;
+  gridSize: number;
+  showAxes: boolean;
+  colorScheme: PcdColorScheme;
+  cloudOpacity: number;
   trajPoints: TrajPoint[];
   offset: [number, number, number];
   yawDeg: number;
@@ -674,15 +680,17 @@ function TrajScene(p: TrajSceneProps) {
         minDistance={0.5}
         maxDistance={300}
       />
-      <gridHelper args={[60, 60, "#3a3a4a", "#22222c"]} />
+      <SceneGrid size={p.gridSize} />
       {/* Z-up local frame (matches the trajectory + cloud conventions). */}
       <group ref={sceneGroupRef} rotation={[-Math.PI / 2, 0, 0]}>
+        {p.showAxes && <WorldAxes />}
         {p.renderMode === "pointcloud" && p.positions && (
           <PointCloudLayer
             positions={p.positions}
             colorHex="#aaccff"
             pointSize={p.pointSize}
-            opacity={0.85}
+            colorScheme={p.colorScheme}
+            opacity={p.cloudOpacity}
           />
         )}
         {p.renderMode === "3dgs" && p.splatSrc && p.splatFormat && (

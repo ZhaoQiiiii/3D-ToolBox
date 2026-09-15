@@ -104,10 +104,16 @@ export interface UseSceneAssetsOptions {
   onAssetLeave?: () => void;
 }
 
-export function useSceneAssets(
-  maxPoints: number,
-  options?: UseSceneAssetsOptions,
-) {
+/**
+ * The single point-cloud sampling budget shared by every mode. Point size /
+ * colour / opacity are shared user controls; the NUMBER of points actually
+ * parsed must also be identical or the same scene renders at clearly
+ * different densities between modes (BBox used to parse at 180k while
+ * SceneGraph/Trajectory used 2M).
+ */
+const SCENE_PCD_MAX_POINTS = 2_000_000;
+
+export function useSceneAssets(options?: UseSceneAssetsOptions) {
   // ---- scene bucket ----
   const { scenes, scene, setScene } = useScene();
 
@@ -219,7 +225,24 @@ export function useSceneAssets(
 
   const setRenderMode = useCallback(
     (mode: SceneRenderMode) => {
-      leaveAsset();
+      const current = getSceneSelectionState();
+      const prevName =
+        current.renderMode === "pointcloud"
+          ? current.selectedCloud
+          : (current.selectedSplat ?? "");
+      const nextName =
+        mode === "pointcloud"
+          ? current.selectedCloud
+          : (current.selectedSplat ?? "");
+      // Only treat it as an asset leave when the render-mode switch actually
+      // changes the active asset. A .ply file is both a point cloud and a
+      // splat, so toggling render mode for the SAME file must not fire
+      // onAssetLeave — otherwise BBox flushes+clears its boxes while
+      // activeName stays unchanged, so the auto-load never re-runs and the
+      // boxes vanish until a full reload.
+      if (prevName !== nextName) {
+        leaveAsset();
+      }
       setSceneSelection({ renderMode: mode });
     },
     [leaveAsset],
@@ -243,7 +266,7 @@ export function useSceneAssets(
   // the canvas would briefly show nothing.
   const [positions, setPositions] = useState<Float32Array | null>(() =>
     scene && selectedCloud && renderMode === "pointcloud"
-      ? (scenePcdCache.get(`${scene}/${selectedCloud}@${maxPoints}`) ?? null)
+      ? (scenePcdCache.get(`${scene}/${selectedCloud}@${SCENE_PCD_MAX_POINTS}`) ?? null)
       : null,
   );
   const [cloudLoading, setCloudLoading] = useState(false);
@@ -270,7 +293,7 @@ export function useSceneAssets(
     // (slower) fetch overwrite the new one's result.
     let cancelled = false;
 
-    const cacheKey = `${scene}/${selectedCloud}@${maxPoints}`;
+    const cacheKey = `${scene}/${selectedCloud}@${SCENE_PCD_MAX_POINTS}`;
     const cached = scenePcdCache.get(cacheKey);
     if (cached) {
       setPositions(cached);
@@ -281,8 +304,8 @@ export function useSceneAssets(
     setCloudError(null);
     const url = `/api/pcd?scene=${encodeURIComponent(scene)}&name=${encodeURIComponent(selectedCloud)}`;
     (selectedCloud.toLowerCase().endsWith(".pcd")
-      ? loadPcd(url, maxPoints)
-      : loadPly(url, maxPoints)
+      ? loadPcd(url, SCENE_PCD_MAX_POINTS)
+      : loadPly(url, SCENE_PCD_MAX_POINTS)
     )
       .then((r) => {
         // The parsed cloud is a pure function of the file content, so cache
@@ -305,7 +328,7 @@ export function useSceneAssets(
     return () => {
       cancelled = true;
     };
-  }, [renderMode, selectedCloud, scene, maxPoints]);
+  }, [renderMode, selectedCloud, scene]);
 
   return {
     // scene bucket

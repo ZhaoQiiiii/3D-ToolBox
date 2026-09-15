@@ -30,6 +30,9 @@ scenes/*
 trajectories/*
 !trajectories/.gitkeep
 
+# IDE local config (TRAE)
+.trae/
+
 # OS junk
 .DS_Store
 Thumbs.db

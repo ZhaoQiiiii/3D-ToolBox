@@ -14,6 +14,13 @@ import { useCallback, useEffect, useState } from "react";
 
 const LS_KEY = "3dtool_scene";
 
+// Module-level SWR cache for the /api/scenes listing: every mode switch
+// remounts the (single) useScene consumer, and without the cache the scene
+// dropdown would flash empty until the refetch round-trips — the same
+// continuity concern as useCloudFiles' listingCache. Seeded immediately,
+// revalidated in the background.
+let scenesCache: string[] | null = null;
+
 function readSceneFromHash(): string | null {
   try {
     const fromHash = new URLSearchParams(window.location.hash.slice(1)).get(
@@ -31,7 +38,7 @@ export function useScene(): {
   scene: string;
   setScene: (scene: string) => void;
 } {
-  const [scenes, setScenes] = useState<string[]>([]);
+  const [scenes, setScenes] = useState<string[]>(() => scenesCache ?? []);
   const [scene, setSceneState] = useState<string>(
     () => readSceneFromHash() ?? localStorage.getItem(LS_KEY) ?? "",
   );
@@ -42,7 +49,9 @@ export function useScene(): {
       .then((r) => r.json())
       .then((j) => {
         if (cancelled) return;
-        setScenes(((j.scenes || []) as { name: string }[]).map((s) => s.name));
+        const names = ((j.scenes || []) as { name: string }[]).map((s) => s.name);
+        scenesCache = names;
+        setScenes(names);
       })
       .catch((e) => console.warn("Failed to list scenes:", e));
     return () => {

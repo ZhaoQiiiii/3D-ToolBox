@@ -38,15 +38,24 @@ export function useCloudFiles(
   );
   const [version, setVersion] = useState(0);
 
+  // Render-phase adjustment ("derived state", supported React pattern): when
+  // the endpoint changes (scene switch), the PREVIOUS scene's listing must
+  // not stay observable — this very render's sibling effects (stale-selection
+  // fallbacks in useSceneAssets) would resolve the NEW scene's selections
+  // against the OLD scene's files, causing a transient 404 on
+  // /api/pcd?scene=<new>&name=<old-file>. Re-seed synchronously from the
+  // cache (which holds data FOR the new scene) or drop to pending. Idempotent
+  // under StrictMode double-render.
+  const [prevEndpoint, setPrevEndpoint] = useState(endpoint);
+  if (prevEndpoint !== endpoint) {
+    setPrevEndpoint(endpoint);
+    setFiles(endpoint ? (listingCache.get(endpoint) ?? []) : []);
+    setLoaded(endpoint ? listingCache.has(endpoint) : false);
+  }
+
   useEffect(() => {
     if (!endpoint) return;
     let cancelled = false;
-    // Serve the cached entry synchronously on remount (see listingCache).
-    const cached = listingCache.get(endpoint);
-    if (cached) {
-      setFiles(cached);
-      setLoaded(true);
-    }
     fetch(endpoint)
       .then((r) => r.json())
       .then((j) => {

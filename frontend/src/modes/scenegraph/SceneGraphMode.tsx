@@ -10,7 +10,8 @@ import { PolyhedraAll } from "./components/PolyhedraAll";
 import { PolyMesh } from "./components/PolyMesh";
 import { TopologicalNodes } from "./components/TopologicalNodes";
 import { TopologicalEdges } from "./components/TopologicalEdges";
-import { WorldAxes } from "./components/WorldAxes";
+import { WorldAxes } from "../../shared/components/WorldAxes";
+import { SceneGrid } from "../../shared/components/SceneGrid";
 import { EditToolbar } from "./components/EditToolbar";
 import { ExportDiffPanel } from "./components/ExportDiffPanel";
 import { NodePropertyPanel } from "./components/NodePropertyPanel";
@@ -19,7 +20,7 @@ import { ObjectPropertyPanel } from "./components/ObjectPropertyPanel";
 import { ObjectsListPanel } from "./components/ObjectsListPanel";
 import { AddNodePanel } from "./components/AddNodePanel";
 import { AddObjectPanel } from "./components/AddObjectPanel";
-import { PointCloudLayer, type PcdColorScheme, SCHEME_LABELS } from "../../shared/components/PointCloudLayer";
+import { PointCloudLayer, type PcdColorScheme } from "../../shared/components/PointCloudLayer";
 import { GaussianSplatLayer } from "../../shared/components/GaussianSplatLayer";
 import {
   MODE_PANEL_STYLE,
@@ -103,10 +104,6 @@ interface Layers {
 }
 
 type LayerKey = keyof Layers;
-
-// Cap scene-level point clouds to avoid freezing the UI when parsing/rendering
-// very large files (e.g. elec.pcd has 6,559,828 points).
-const SCENE_PCD_MAX_POINTS = 2_000_000;
 
 // Shared overlay chrome. Most floating panels share the same dark background,
 // text colour and monospace font; individual panels only override what differs
@@ -1066,6 +1063,9 @@ function Scene({
   pcdPointSize,
   pcdColorScheme,
   renderMode,
+  gridSize,
+  showAxes,
+  cloudOpacity,
   splatSrc,
   splatFormat,
   onSplatLoadingChange,
@@ -1102,6 +1102,9 @@ function Scene({
   pcdPointSize: number;
   pcdColorScheme: PcdColorScheme;
   renderMode: "pointcloud" | "3dgs";
+  gridSize: number;
+  showAxes: boolean;
+  cloudOpacity: number;
   splatSrc: string | null;
   splatFormat: SplatFormat;
   onSplatLoadingChange: (loading: boolean) => void;
@@ -1172,7 +1175,7 @@ function Scene({
       <directionalLight position={[10, 15, 5]} intensity={1.2} />
 
       <group ref={sceneGroupRef} rotation={[-Math.PI / 2, 0, 0]}>
-        <WorldAxes />
+        {showAxes && <WorldAxes />}
         {areaBoxes}
         {layers.areaEdges && <AreaEdges areas={effectiveAreas} visible />}
         {layers.areaCenters && (
@@ -1235,6 +1238,7 @@ function Scene({
               colorHex={layer.colorHex}
               pointSize={pcdPointSize}
               colorScheme={pcdColorScheme}
+              opacity={cloudOpacity}
             />
           ))}
         {/* 3DGS mode: DropInViewer lives in the same rotated (Z-up→Y-up)
@@ -1271,7 +1275,7 @@ function Scene({
         />
       </group>
 
-      <gridHelper args={[80, 80, "#333", "#222"]} />
+      <SceneGrid size={gridSize} />
       <OrbitControls
         ref={controlsRef}
         makeDefault
@@ -1321,7 +1325,7 @@ export function SceneGraphMode() {
     positions,
     cloudLoading,
     cloudError,
-  } = useSceneAssets(SCENE_PCD_MAX_POINTS);
+  } = useSceneAssets();
   const [data, setData] = useState<SceneData | null>(null);
   const [snapshot, setSnapshot] = useState<string>("");
   const [snapshots, setSnapshots] = useState<{ name: string; saved_at: string; summary: any }[]>([]);
@@ -1405,9 +1409,20 @@ export function SceneGraphMode() {
   const [topoEdgeThickness, setTopoEdgeThickness] = useLocalStorageState("disp_topoEdge_v2", 2);
   const [objectSize, setObjectSize] = useLocalStorageState("disp_objSize_v2", 0.02);
   const [objectLineThickness, setObjectLineThickness] = useLocalStorageState("disp_objLine_v2", 0.01);
-  const [pcdColorScheme, setPcdColorScheme] = useLocalStorageState<PcdColorScheme>("disp_pcdScheme", "flat");
-  // Scene point size: the ONE shared setting across all three modes.
-  const { pointSize: pcdPointSize, setPointSize: setPcdPointSize } = useSceneVisuals();
+  // Scene point size / color scheme / grid / axes: the ONE shared setting
+  // across all three modes.
+  const {
+    pointSize: pcdPointSize,
+    setPointSize: setPcdPointSize,
+    gridSize,
+    setGridSize,
+    showAxes,
+    setShowAxes,
+    colorScheme: pcdColorScheme,
+    setColorScheme: setPcdColorScheme,
+    opacity,
+    setOpacity,
+  } = useSceneVisuals();
 
   // Selection filter
   const [selectableKinds, setSelectableKinds] = useState<Set<PickKind>>(
@@ -2219,6 +2234,9 @@ export function SceneGraphMode() {
       pcdPointSize={pcdPointSize}
       pcdColorScheme={pcdColorScheme}
       renderMode={renderMode}
+      gridSize={gridSize}
+      showAxes={showAxes}
+      cloudOpacity={opacity}
       splatSrc={renderMode === "3dgs" ? activeUrl : null}
       splatFormat={(activeFormat as SplatFormat | null) ?? "ply"}
       onSplatLoadingChange={setSplatLoading}
@@ -2321,6 +2339,16 @@ export function SceneGraphMode() {
           onSelectSplat={selectSplat}
           loading={renderMode === "pointcloud" ? cloudLoading : splatLoading}
           error={renderMode === "pointcloud" ? cloudError : splatError}
+          pointSize={pcdPointSize}
+          onPointSizeChange={setPcdPointSize}
+          gridSize={gridSize}
+          onGridSizeChange={setGridSize}
+          showAxes={showAxes}
+          onShowAxesChange={setShowAxes}
+          colorScheme={pcdColorScheme}
+          onColorSchemeChange={setPcdColorScheme}
+          opacity={opacity}
+          onOpacityChange={setOpacity}
         />
 
         {/* Mode visualization panel — a standalone list below the shared
@@ -2395,36 +2423,6 @@ export function SceneGraphMode() {
                   {pcdLayers.reduce((s, l) => s + l.positions.length / 3, 0)} points
                 </div>
               )}
-              <PanelSlider
-                label="Point size"
-                value={pcdPointSize}
-                min={0.01}
-                max={0.3}
-                step={0.01}
-                onChange={setPcdPointSize}
-              />
-              {/* PCD color scheme */}
-              <select
-                value={pcdColorScheme}
-                onChange={(e) => setPcdColorScheme(e.target.value as PcdColorScheme)}
-                style={{
-                  width: "100%",
-                  background: "#141428",
-                  color: "#e0e6f0",
-                  border: "1px solid #3a3a5c",
-                  borderRadius: 6,
-                  padding: "3px 6px",
-                  fontFamily: "monospace",
-                  fontSize: 12,
-                  marginTop: 6,
-                  outline: "none",
-                  cursor: "pointer",
-                }}
-              >
-                {Object.entries(SCHEME_LABELS).map(([k, v]) => (
-                  <option key={k} value={k}>{v}</option>
-                ))}
-              </select>
             </>
           )}
 
@@ -2877,17 +2875,13 @@ export function SceneGraphMode() {
             top: "50%",
             left: "50%",
             transform: "translate(-50%,-50%)",
-            background: "rgba(0,0,0,0.75)",
-            borderRadius: 8,
-            padding: "12px 20px",
-            color: "#fff",
-            fontSize: 14,
+            color: "#666",
             fontFamily: "monospace",
+            fontSize: 14,
             pointerEvents: "none",
-            zIndex: 5,
           }}
         >
-          正在渲染 3DGS…
+          Loading...
         </div>
       )}
 

@@ -7,6 +7,17 @@
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
       html, body, #root { width: 100%; height: 100%; background: #111; color: #ccc; font-family: monospace; }
+      /* Hide the native number-input spinner in the stepper controls — the
+         explicit ▲/▼ buttons replace it. */
+      input.panel-stepper-input::-webkit-inner-spin-button,
+      input.panel-stepper-input::-webkit-outer-spin-button {
+        -webkit-appearance: none;
+        margin: 0;
+      }
+      input.panel-stepper-input {
+        -moz-appearance: textfield;
+        appearance: textfield;
+      }
     </style>
   </head>
   <body>

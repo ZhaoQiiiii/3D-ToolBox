@@ -13,8 +13,10 @@ import {
   vecMin,
   vecMax,
 } from "./lib/bbox";
-import { PointCloudLayer } from "../../shared/components/PointCloudLayer";
+import { PointCloudLayer, type PcdColorScheme } from "../../shared/components/PointCloudLayer";
 import { GaussianSplatLayer } from "../../shared/components/GaussianSplatLayer";
+import { WorldAxes } from "../../shared/components/WorldAxes";
+import { SceneGrid } from "../../shared/components/SceneGrid";
 import type { DropInViewer } from "@mkkellogg/gaussian-splats-3d";
 import { BBoxLayer } from "./components/BBoxLayer";
 import { BBoxPanel } from "./components/BBoxPanel";
@@ -39,11 +41,6 @@ import {
   rayHitHorizontalPlane,
   verticalDragWorld,
 } from "../../shared/lib/projection";
-
-// Cap the parsed cloud to keep rendering responsive (elec.pcd is ~6.5M points).
-// Annotation needs finer detail than the background-visualization modes, so
-// BBox parses at a lower budget than SceneGraph/Trajectory's 2M default.
-const PCD_MAX_POINTS = 180_000;
 
 type RenderMode = "pointcloud" | "3dgs";
 
@@ -441,6 +438,10 @@ function Scene({
   draftMin,
   anchorZRef,
   renderMode,
+  gridSize,
+  showAxes,
+  colorScheme,
+  cloudOpacity,
   splatSrc,
   splatFormat,
   onSplatLoadingChange,
@@ -461,6 +462,10 @@ function Scene({
   draftMin: Vec3 | null;
   anchorZRef: React.MutableRefObject<number>;
   renderMode: RenderMode;
+  gridSize: number;
+  showAxes: boolean;
+  colorScheme: PcdColorScheme;
+  cloudOpacity: number;
   splatSrc: string | null;
   splatFormat: SplatFormat;
   onSplatLoadingChange: (loading: boolean) => void;
@@ -497,13 +502,15 @@ function Scene({
       <directionalLight position={[10, 15, 5]} intensity={1.2} />
 
       <group ref={sceneGroupRef} rotation={[-Math.PI / 2, 0, 0]}>
+        {showAxes && <WorldAxes />}
         {renderMode === "pointcloud" && (
           <PointCloudLayer
             ref={pointsRef}
             positions={positions}
             colorHex="#aaccff"
             pointSize={pointSize}
-            opacity={0.85}
+            colorScheme={colorScheme}
+            opacity={cloudOpacity}
           />
         )}
 
@@ -542,7 +549,7 @@ function Scene({
         )}
       </group>
 
-      <gridHelper args={[160, 80, "#333", "#222"]} />
+      <SceneGrid size={gridSize} />
       <CameraControls ref={controlsRef} />
       <Picker
         sceneGroupRef={sceneGroupRef}
@@ -568,7 +575,18 @@ const useLocalStorageState = createLocalStorageHook("3dbbox_");
 
 export function BBoxMode() {
   // Scene point size: the ONE shared setting across all three modes.
-  const { pointSize, setPointSize } = useSceneVisuals();
+  const {
+    pointSize,
+    setPointSize,
+    gridSize,
+    setGridSize,
+    showAxes,
+    setShowAxes,
+    colorScheme,
+    setColorScheme,
+    opacity: cloudOpacity,
+    setOpacity: setCloudOpacity,
+  } = useSceneVisuals();
   const [handleRadius, setHandleRadius] = useLocalStorageState<number>("handleRadius", 0.12);
   const [lineWidth, setLineWidth] = useLocalStorageState<number>("lineWidth", 0.04);
   const [opacity, setOpacity] = useLocalStorageState<number>("opacity", 0.08);
@@ -672,7 +690,7 @@ export function BBoxMode() {
     positions,
     cloudLoading,
     cloudError,
-  } = useSceneAssets(PCD_MAX_POINTS, {
+  } = useSceneAssets({
     onAssetLeave: () => {
       if (dirtyRef.current) {
         enqueueSave(activeNameRef.current, boxesRef.current).catch(() => {});
@@ -980,6 +998,10 @@ export function BBoxMode() {
       draftMin={draftMin}
       anchorZRef={anchorZRef}
       renderMode={renderMode}
+      gridSize={gridSize}
+      showAxes={showAxes}
+      colorScheme={colorScheme}
+      cloudOpacity={cloudOpacity}
       splatSrc={renderMode === "3dgs" ? activeUrl : null}
       splatFormat={(activeFormat ?? "ply") as SplatFormat}
       onSplatLoadingChange={setSplatLoading}
@@ -1014,6 +1036,16 @@ export function BBoxMode() {
           onSelectSplat={selectSplat}
           loading={renderMode === "pointcloud" ? cloudLoading : splatLoading}
           error={renderMode === "pointcloud" ? cloudError : splatError}
+          pointSize={pointSize}
+          onPointSizeChange={setPointSize}
+          gridSize={gridSize}
+          onGridSizeChange={setGridSize}
+          showAxes={showAxes}
+          onShowAxesChange={setShowAxes}
+          colorScheme={colorScheme}
+          onColorSchemeChange={setColorScheme}
+          opacity={cloudOpacity}
+          onOpacityChange={setCloudOpacity}
         />
 
         {/* Mode visualization panel — standalone list below the scene
@@ -1023,16 +1055,6 @@ export function BBoxMode() {
           <div style={MODE_PANEL_TITLE}>
             <span style={{ color: "#3498db" }}>◈</span> BBox
           </div>
-          {renderMode === "pointcloud" && (
-            <PanelSlider
-              label="点云大小"
-              value={pointSize}
-              min={0.01}
-              max={0.3}
-              step={0.01}
-              onChange={setPointSize}
-            />
-          )}
           <PanelSlider
             label="角点大小"
             value={handleRadius}
@@ -1098,7 +1120,7 @@ export function BBoxMode() {
             pointerEvents: "none",
           }}
         >
-          Loading point cloud…
+          Loading...
         </div>
       )}
 
@@ -1134,7 +1156,7 @@ export function BBoxMode() {
             pointerEvents: "none",
           }}
         >
-          Loading 3DGS…
+          Loading...
         </div>
       )}
 
