@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { SCHEME_LABELS, type PcdColorScheme } from "./PointCloudLayer";
+import { NO_ASSET } from "../use-scene-assets";
 
 export type SceneRenderMode = "pointcloud" | "3dgs";
 
 /**
  * Left-side column shared by all three modes: it stacks the unified scene
  * panel (render mode + cloud/splat file selection) on top of any
- * mode-specific panels (Trajectory step info, SceneGraph snapshot selector).
+ * mode-specific panels (Trajectory step info, SceneGraph layer toggles).
  *
  * `pointerEvents` stays enabled: the column only wraps its children, and the
  * small gap areas behaving as overlay (data-overlay) matches the existing
@@ -29,8 +30,8 @@ export const SCENE_COLUMN_STYLE: CSSProperties = {
 
 /**
  * Right-side column for mode-specific tool panels (BBox object list,
- * Trajectory path browser, SceneGraph layers/edit panels). Fixed to the
- * same width as the left scene column so both rails stay proportional.
+ * Trajectory path browser, SceneGraph snapshot/display + edit panels). Fixed
+ * to the same width as the left scene column so both rails stay proportional.
  */
 export const TOOLS_COLUMN_STYLE: CSSProperties = {
   position: "absolute",
@@ -61,9 +62,8 @@ const PANEL: CSSProperties = {
 };
 
 /**
- * Shared card style for the mode-specific visualization panel that stacks
- * below the SceneAssetPanel in the left column (BBox parameters, SceneGraph
- * snapshot/display panel).
+ * Shared card style for the mode-specific panels that stack in a tool
+ * column (BBox parameters, SceneGraph snapshot/display panel).
  */
 export const MODE_PANEL_STYLE: CSSProperties = {
   ...PANEL,
@@ -182,13 +182,14 @@ export function SceneAssetPanel({
 }: Props) {
   // Keep a valid selection visible even when the active file is not part of
   // the listing (e.g. a stale persisted selection before the listing
-  // arrives).
+  // arrives). The "None" sentinel is a real option, not a stale file, so it
+  // must not be promoted into the file list.
   const cloudOptions =
-    selectedCloud && !cloudFiles.includes(selectedCloud)
+    selectedCloud && selectedCloud !== NO_ASSET && !cloudFiles.includes(selectedCloud)
       ? [selectedCloud, ...cloudFiles]
       : cloudFiles;
   const splatOptions =
-    selectedSplat && !splatFiles.includes(selectedSplat)
+    selectedSplat && selectedSplat !== NO_ASSET && !splatFiles.includes(selectedSplat)
       ? [selectedSplat, ...splatFiles]
       : splatFiles;
 
@@ -231,6 +232,7 @@ export function SceneAssetPanel({
             onChange={(e) => onSelectCloud(e.target.value)}
             style={{ ...selectStyle, marginBottom: 8 }}
           >
+            <option value={NO_ASSET}>None</option>
             <optgroup label="场景文件">
               {cloudOptions.map((name) => (
                 <option key={name} value={name}>
@@ -248,6 +250,7 @@ export function SceneAssetPanel({
             onChange={(e) => onSelectSplat(e.target.value || null)}
             style={{ ...selectStyle, marginBottom: 8 }}
           >
+            <option value={NO_ASSET}>None</option>
             {splatOptions.map((name) => (
               <option key={name} value={name}>
                 ◆ {name}
@@ -492,7 +495,6 @@ export function PanelSlider({
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: 2 }}>
         <input
-          className="panel-stepper-input"
           type="number"
           step={step}
           min={min}

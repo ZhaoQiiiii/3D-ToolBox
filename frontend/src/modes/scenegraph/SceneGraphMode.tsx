@@ -95,7 +95,6 @@ interface Layers {
   areas: boolean;
   areaEdges: boolean;
   areaCenters: boolean;
-  polyPoints: boolean;
   polyWireframe: boolean;
   polyMesh: boolean;
   topoNodes: boolean;
@@ -125,6 +124,16 @@ const FLOATING_OVERLAY: CSSProperties = {
   position: "absolute",
 };
 
+/** One row per layer group, wrapping when the card is too narrow. */
+const TOGGLE_ROW: CSSProperties = {
+  display: "flex",
+  flexWrap: "wrap",
+  alignItems: "center",
+  // Generous row gap so wrapped toggle rows do not read as one cramped block.
+  gap: "10px 16px",
+  lineHeight: 1.5,
+};
+
 const HINT_BAR: CSSProperties = {
   ...FLOATING_OVERLAY,
   bottom: 16,
@@ -138,6 +147,28 @@ const HINT_BAR: CSSProperties = {
   borderRadius: 6,
   color: "#ddd",
   fontSize: 12,
+};
+
+/**
+ * Pick-filter bar, centered directly under the edit toolbar. It only exists in
+ * edit mode because the 3D picker itself is disabled in view mode — keeping it
+ * out of the Layers card avoids offering a control that silently does nothing.
+ */
+const SELECT_FILTER_BAR: CSSProperties = {
+  ...FLOATING_OVERLAY,
+  // The edit toolbar ends at y≈62; the extra 10px keeps the two bars visually
+  // separate instead of touching edge to edge.
+  top: 72,
+  left: "50%",
+  transform: "translateX(-50%)",
+  zIndex: 12,
+  display: "flex",
+  alignItems: "center",
+  gap: 14,
+  padding: "6px 14px",
+  borderRadius: 8,
+  fontSize: 12,
+  userSelect: "none",
 };
 
 interface ConnectionNotice {
@@ -1181,12 +1212,10 @@ function Scene({
         {layers.areaCenters && (
           <AreaCenters areas={effectiveAreas} visible />
         )}
-        {(layers.polyPoints || layers.polyWireframe) && (
+        {layers.polyWireframe && (
           <PolyhedraAll
             areas={effectiveAreas}
             effectivePolys={effectivePolys}
-            visible={layers.polyPoints}
-            showWireframe={layers.polyWireframe}
             selectedArea={selectedArea}
           />
         )}
@@ -1311,6 +1340,7 @@ export function SceneGraphMode() {
   const {
     scenes,
     scene,
+    scenesLoaded,
     selectScene,
     cloudFiles,
     splatFiles,
@@ -1335,7 +1365,6 @@ export function SceneGraphMode() {
     areas: true,
     areaEdges: false,
     areaCenters: false,
-    polyPoints: false,
     polyWireframe: false,
     polyMesh: false,
     topoNodes: true,
@@ -1446,10 +1475,21 @@ export function SceneGraphMode() {
   const mutationsRef = useRef(mutations);
   mutationsRef.current = mutations;
 
-  // Mirror of `snapshot` for post-await guards: the export fetch is async and
-  // the user may switch snapshots while it is in flight.
+  // Mirrors of `scene` / `snapshot` for post-await guards: those fetches are
+  // async and the user may switch scene OR snapshot while one is in flight,
+  // and two scenes can share a snapshot name — so the guard has to compare
+  // both, not just the snapshot.
   const snapshotRef = useRef(snapshot);
   snapshotRef.current = snapshot;
+  const sceneRef = useRef(scene);
+  sceneRef.current = scene;
+
+  // Set by the snapshot-listing effect once the listing for the CURRENT scene
+  // has settled. Phase 2's "None" branch consults it: while the listing is
+  // still in flight `snapshot` is transiently "" too, and clearing `loading`
+  // there would flash the empty state before the first snapshot starts
+  // loading.
+  const snapshotsSettledRef = useRef(false);
 
   const commitEdit = useCallback(
     (update: (current: Mutations) => Mutations) => {
@@ -1517,14 +1557,23 @@ export function SceneGraphMode() {
     setPreviewNodePositions(new Map());
     setBase("saved");
     setError(null);
+    // A scene switch may leave this scene's listing in flight; until it
+    // settles, Phase 2 must not treat the transient "" as an explicit "None".
+    snapshotsSettledRef.current = false;
+    // Stale-response guard: switching scenes mid-fetch must not let the
+    // previous scene's listing set `snapshot`, which would make Phase 2 load
+    // the new scene at the OLD scene's snapshot name.
+    let cancelled = false;
     (async () => {
       try {
         const resp = await fetch(
           `/api/snapshots?scene=${encodeURIComponent(scene)}`,
         );
         const json = await resp.json();
+        if (cancelled) return;
         const list = json.snapshots || [];
         setSnapshots(list);
+        snapshotsSettledRef.current = true;
         if (list.length > 0) {
           setSnapshot(list[0].name); // triggers Phase 2
         } else {
@@ -1534,15 +1583,40 @@ export function SceneGraphMode() {
           setLoading(false);
         }
       } catch (e) {
+        if (cancelled) return;
         setError(e instanceof Error ? e.message : String(e));
         setLoading(false);
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [scene]);
+
+  // No scene at all (empty scenes/ dir, or the listing failed): nothing will
+  // ever be fetched, so the spinner must not stay up for the session. The
+  // `scenes.length === 0` part matters — when the listing settled WITH scenes,
+  // `scene` is transiently "" for exactly one commit (the hook picks the first
+  // entry right after), and clearing `loading` there would flash the empty
+  // state before that pick lands.
+  useEffect(() => {
+    if (!scene && scenesLoaded && scenes.length === 0) setLoading(false);
+  }, [scene, scenesLoaded, scenes]);
 
   // Phase 2: load scene graph for selected snapshot
   useEffect(() => {
-    if (!snapshot || !scene) return;
+    if (!scene) return;
+    // "None" selected: nothing to fetch. `loading` must still be cleared here,
+    // because the cleanup of the PREVIOUS run already set `cancelled = true`,
+    // so its own `setLoading(false)` is skipped — picking "None" while a
+    // snapshot was still in flight would otherwise leave the spinner up for
+    // the rest of the session. Guarded by `snapshotsSettledRef` so the
+    // transient "" of a scene switch (listing still in flight) does not clear
+    // it and flash the empty state before the first snapshot loads.
+    if (!snapshot) {
+      if (snapshotsSettledRef.current) setLoading(false);
+      return;
+    }
     let cancelled = false;
     (async () => {
       setLoading(true);
@@ -1994,24 +2068,28 @@ export function SceneGraphMode() {
     setPreviewNodePositions(new Map());
     setBase("saved");
     if (snapshot && scene) {
-      // Snapshot-switch competition guard (same pattern as handleExport):
-      // if the user switches snapshots while this reload is in flight, a
-      // late response must not clobber the newly-selected snapshot's data
-      // or prematurely clear its loading state.
+      // Scene/snapshot-switch competition guard (same pattern as
+      // handleExport): if the user switches scene or snapshot while this
+      // reload is in flight, a late response must not clobber the
+      // newly-selected pair's data or prematurely clear its loading state.
+      // Both are compared: two scenes can hold a snapshot of the same name.
       const target = snapshot;
+      const targetScene = scene;
       try {
         setLoading(true);
         const { data: freshData } = await loadSceneGraph(
           `/api/scene-graph?scene=${encodeURIComponent(scene)}&snapshot=${encodeURIComponent(target)}&source=saved`,
         );
-        if (snapshotRef.current !== target) return;
+        if (snapshotRef.current !== target || sceneRef.current !== targetScene) return;
         setData(freshData);
       } catch (e) {
-        if (snapshotRef.current === target) {
+        if (snapshotRef.current === target && sceneRef.current === targetScene) {
           setError(e instanceof Error ? e.message : String(e));
         }
       } finally {
-        if (snapshotRef.current === target) setLoading(false);
+        if (snapshotRef.current === target && sceneRef.current === targetScene) {
+          setLoading(false);
+        }
       }
     }
   }, [snapshot, scene]);
@@ -2019,7 +2097,9 @@ export function SceneGraphMode() {
   // ---- snapshot switching ----
 
   const handleSwitchSnapshot = useCallback((name: string) => {
-    if (name === snapshot || !name) return;
+    // "" is the explicit "None" choice (render no scene graph), so it must not
+    // be filtered out as an empty input — Phase 2 simply never loads.
+    if (name === snapshot) return;
     setSnapshot(name);
     setData(null);
     setEditHistory(createHistory(emptyMutations()));
@@ -2073,13 +2153,15 @@ export function SceneGraphMode() {
         return;
       }
       logEvent("export ok", { snapshot });
-      // The awaits below are interruptible: if the user switched snapshots
-      // while the export was in flight, do NOT clobber the newly-selected
-      // snapshot's data with this one's reload.
+      // The awaits below are interruptible: if the user switched scene or
+      // snapshot while the export was in flight, do NOT clobber the
+      // newly-selected pair's data with this one's reload. Both are compared
+      // because two scenes can hold a snapshot of the same name.
+      const targetScene = scene;
       const { data: newData } = await loadSceneGraph(
         `/api/scene-graph?scene=${encodeURIComponent(scene)}&snapshot=${encodeURIComponent(snapshot)}`,
       );
-      if (snapshotRef.current !== snapshot) return;
+      if (snapshotRef.current !== snapshot || sceneRef.current !== targetScene) return;
       setData(newData);
       // Only reset the edit history when nothing was committed while the
       // export was in flight — otherwise those pending edits would be
@@ -2270,6 +2352,7 @@ export function SceneGraphMode() {
         exporting={exporting}
         showDiff={showDiff}
         showShortcuts={showShortcuts}
+        hasGraph={!!data}
         notice={toolbarNotice}
         onToggleEdit={handleToggleEdit}
         onReset={handleReset}
@@ -2291,13 +2374,42 @@ export function SceneGraphMode() {
         onToggleShortcuts={() => setShowShortcuts((v) => !v)}
       />
 
+      {/* Pick filter — edit mode only, centered under the edit toolbar. */}
+      {editMode === "edit" && (
+        <div data-overlay style={SELECT_FILTER_BAR}>
+          <span style={{ color: "#8ab4d8", letterSpacing: 0.5 }}>
+            Selection Filter
+          </span>
+          <SelectToggle
+            label="Nodes"
+            kind="node"
+            selectableKinds={selectableKinds}
+            toggle={toggleSelectable}
+          />
+          <SelectToggle
+            label="Edges"
+            kind="edge"
+            selectableKinds={selectableKinds}
+            toggle={toggleSelectable}
+          />
+          <SelectToggle
+            label="Objects"
+            kind="object"
+            selectableKinds={selectableKinds}
+            toggle={toggleSelectable}
+          />
+        </div>
+      )}
+
       {connectionNotice && (
         <div
           data-overlay
           role="status"
           style={{
             ...FLOATING_OVERLAY,
-            top: 112,
+            // Sits below the Selection Filter bar (top 72, ~30px tall) with the
+            // same ~20px breathing room it had before that bar moved down.
+            top: 122,
             left: "50%",
             transform: "translateX(-50%)",
             zIndex: 20,
@@ -2320,8 +2432,8 @@ export function SceneGraphMode() {
 
       {/* Unified left-side scene column shared by all three modes: the
           shared scene-selection panel (render mode / file),
-          then this mode's visualization panel below it as a standalone
-          panel with the column gap in between. */}
+          then the layer toggles below it as a standalone panel with the
+          column gap in between. */}
       <div data-overlay style={SCENE_COLUMN_STYLE}>
         {/* Shared scene-selection panel (render mode / cloud or splat
             file) — same plain file list as the other two modes. */}
@@ -2351,15 +2463,11 @@ export function SceneGraphMode() {
           onOpacityChange={setOpacity}
         />
 
-        {/* Mode visualization panel — a standalone list below the shared
-            scene panel (column gap in between): snapshot + data root,
-            point-cloud source, cloud appearance and the Display sliders.
-            Always visible: the pickers must remain reachable even when the
-            current root has no snapshots. */}
+        {/* Mode visualization panel — the SceneGraph snapshot/display block and
+            the layer toggles merged into a single card, stacked below the
+            shared scene panel with the column gap in between. */}
         <div style={MODE_PANEL_STYLE}>
-          <div style={MODE_PANEL_TITLE}>
-            <span style={{ color: "#3498db" }}>◈</span> SceneGraph
-          </div>
+          <div style={MODE_PANEL_TITLE}>SceneGraph</div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 8, width: "100%" }}>
             <span style={{ color: "#8ab4d8", fontSize: 11, whiteSpace: "nowrap" }}>Snapshot:</span>
@@ -2381,6 +2489,9 @@ export function SceneGraphMode() {
                 cursor: "pointer",
               }}
             >
+              {/* None = load no snapshot at all: the scene graph layers stay
+                  empty while the point cloud / 3DGS scene keeps rendering. */}
+              <option value="">None</option>
               {snapshots.map((s) => (
                 <option key={s.name} value={s.name}>
                   {s.name}
@@ -2401,7 +2512,7 @@ export function SceneGraphMode() {
                 fontSize: 11,
                 color: "#8ab4d8",
                 justifyContent: "center",
-                marginTop: 6,
+                marginTop: 8,
               }}
             >
               <span>
@@ -2416,163 +2527,109 @@ export function SceneGraphMode() {
             </div>
           )}
 
-          {renderMode === "pointcloud" && (
-            <>
-              {pcdLayers.length > 0 && !cloudLoading && (
-                <div style={{ fontSize: 11, color: "#8ab4d8", marginTop: 4 }}>
-                  {pcdLayers.reduce((s, l) => s + l.positions.length / 3, 0)} points
-                </div>
-              )}
-            </>
-          )}
-
           {/* Display sliders (moved out of the Layers panel). */}
-          <div style={{ margin: "10px 0 6px", borderTop: "1px solid rgba(52,152,219,0.25)" }} />
-          <div style={{ fontSize: 11, color: "#8ab4d8", marginBottom: 3, letterSpacing: 0.5 }}>
+          <div style={{ margin: "12px 0 8px", borderTop: "1px solid rgba(52,152,219,0.25)" }} />
+          <div style={{ fontSize: 11, color: "#8ab4d8", marginBottom: 5, letterSpacing: 0.5 }}>
             Display
           </div>
-          <PanelSlider label="Node size" value={nodeSize} min={0.02} max={0.50} step={0.01} onChange={setNodeSize} />
-          <PanelSlider label="Edge thick" value={topoEdgeThickness} min={0.5} max={4.0} step={0.5} onChange={setTopoEdgeThickness} decimals={1} />
-          <PanelSlider label="Object size" value={objectSize} min={0.02} max={0.50} step={0.01} onChange={setObjectSize} />
-          <PanelSlider label="Obj line" value={objectLineThickness} min={0.01} max={0.20} step={0.005} onChange={setObjectLineThickness} decimals={3} />
+          <PanelSlider label="Node Size" value={nodeSize} min={0.02} max={0.50} step={0.01} onChange={setNodeSize} />
+          <PanelSlider label="Edge Thickness" value={topoEdgeThickness} min={0.5} max={4.0} step={0.5} onChange={setTopoEdgeThickness} />
+          <PanelSlider label="Object Size" value={objectSize} min={0.02} max={0.50} step={0.01} onChange={setObjectSize} />
+          <PanelSlider label="Object Line" value={objectLineThickness} min={0.01} max={0.20} step={0.01} onChange={setObjectLineThickness} />
+
+          {/* Layers — the toggle groups as a section of this card. The divider
+              and the heading belong to the section: with no scene graph loaded
+              (None snapshot / failed load) they would label an empty card. */}
+          {data && (
+            <div style={{ fontSize: 12 }}>
+              <div style={{ margin: "12px 0 8px", borderTop: "1px solid rgba(52,152,219,0.25)" }} />
+              <div style={{ fontSize: 12, color: "#8ab4d8", marginBottom: 6 }}>
+                Layers
+              </div>
+              <div style={TOGGLE_ROW}>
+                <Toggle
+                  label="Area Boxes"
+                  k="areas"
+                  layers={layers}
+                  toggle={toggle}
+                />
+                <Toggle
+                  label="Area Edges"
+                  k="areaEdges"
+                  layers={layers}
+                  toggle={toggle}
+                />
+                <Toggle
+                  label="Area Centers"
+                  k="areaCenters"
+                  layers={layers}
+                  toggle={toggle}
+                />
+              </div>
+
+              <div style={{ margin: "14px 0 8px", borderTop: "1px solid #333" }} />
+              <div style={{ fontSize: 12, color: "#8ab4d8", marginBottom: 6 }}>
+                Polyhedra
+              </div>
+              <div style={TOGGLE_ROW}>
+                <Toggle
+                  label="Poly Wireframe"
+                  k="polyWireframe"
+                  layers={layers}
+                  toggle={toggle}
+                />
+                <Toggle
+                  label="Poly Mesh"
+                  k="polyMesh"
+                  layers={layers}
+                  toggle={toggle}
+                />
+              </div>
+              {layers.polyMesh && (
+                <div style={{ paddingLeft: 20, marginBottom: 4 }}>
+                  <PanelSlider
+                    label="Mesh α"
+                    value={meshOpacity}
+                    min={0.01}
+                    max={1}
+                    step={0.01}
+                    onChange={setMeshOpacity}
+                  />
+                </div>
+              )}
+
+              <div style={{ margin: "14px 0 8px", borderTop: "1px solid #333" }} />
+              <div style={{ fontSize: 12, color: "#8ab4d8", marginBottom: 6 }}>
+                Topology Graph
+              </div>
+              <div style={TOGGLE_ROW}>
+                <Toggle
+                  label="Topo Nodes"
+                  k="topoNodes"
+                  layers={layers}
+                  toggle={toggle}
+                />
+                <Toggle
+                  label="Topo Edges"
+                  k="topoEdges"
+                  layers={layers}
+                  toggle={toggle}
+                />
+                <Toggle
+                  label="Objects"
+                  k="objects"
+                  layers={layers}
+                  toggle={toggle}
+                />
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Right-side tools column: layer toggles and (in edit mode) the
-          object/node/area editing panels. */}
+      {/* Right-side tools column: (in edit mode) the object/node/area
+          editing panels. */}
       <div data-overlay style={TOOLS_COLUMN_STYLE}>
-        {data && (
-          <>
-            {/* Layer toggles — visible in both view and edit mode, inside the
-                right-side tools column. */}
-            <div
-              style={{
-                ...DARK_PANEL,
-                borderRadius: 8,
-                padding: "12px 14px",
-                fontSize: 12,
-                width: "100%",
-                boxSizing: "border-box",
-                flexShrink: 0,
-                userSelect: "none",
-              }}
-            >
-              <div
-                style={{
-                  color: "#fff",
-                  fontWeight: 600,
-                  marginBottom: 10,
-                  fontSize: 15,
-                  letterSpacing: 0.5,
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 6,
-                }}
-              >
-                <span style={{ color: "#3498db" }}>◈</span> Layers
-              </div>
-
-              <Toggle
-                label="Area Boxes"
-                k="areas"
-                layers={layers}
-                toggle={toggle}
-              />
-              <Toggle
-                label="Area Edges"
-                k="areaEdges"
-                layers={layers}
-                toggle={toggle}
-              />
-              <Toggle
-                label="Area Centers"
-                k="areaCenters"
-                layers={layers}
-                toggle={toggle}
-              />
-
-              <div style={{ margin: "6px 0 4px", borderTop: "1px solid #333" }} />
-              <div style={{ fontSize: 12, color: "#8ab4d8", marginBottom: 2 }}>
-                Polyhedra
-              </div>
-              <Toggle
-                label="Poly Points"
-                k="polyPoints"
-                layers={layers}
-                toggle={toggle}
-              />
-              <Toggle
-                label="Poly Wireframe"
-                k="polyWireframe"
-                layers={layers}
-                toggle={toggle}
-              />
-              <Toggle
-                label="Poly Mesh"
-                k="polyMesh"
-                layers={layers}
-                toggle={toggle}
-              />
-              {layers.polyMesh && (
-                <div style={{ paddingLeft: 20, marginTop: 2, marginBottom: 4 }}>
-                  <input
-                    type="range"
-                    min={1}
-                    max={100}
-                    value={Math.round(meshOpacity * 100)}
-                    onChange={(e) =>
-                      setMeshOpacity(Number(e.target.value) / 100)
-                    }
-                    style={{
-                      width: "100%",
-                      accentColor: "#3498db",
-                      height: 4,
-                      cursor: "pointer",
-                    }}
-                  />
-                  <span style={{ fontSize: 12, color: "#8ab4d8" }}>
-                    {Math.round(meshOpacity * 100)}%
-                  </span>
-                </div>
-              )}
-
-              <div style={{ margin: "6px 0 4px", borderTop: "1px solid #333" }} />
-              <div style={{ fontSize: 12, color: "#8ab4d8", marginBottom: 2 }}>
-                Topology Graph
-              </div>
-              <Toggle
-                label="Topo Nodes"
-                k="topoNodes"
-                layers={layers}
-                toggle={toggle}
-              />
-              <Toggle
-                label="Topo Edges"
-                k="topoEdges"
-                layers={layers}
-                toggle={toggle}
-              />
-              <Toggle
-                label="Objects"
-                k="objects"
-                layers={layers}
-                toggle={toggle}
-              />
-
-              {/* Display tweaks */}
-              <div style={{ margin: "6px 0 4px", borderTop: "1px solid #333" }} />
-              <div style={{ fontSize: 12, color: "#8ab4d8", marginBottom: 4 }}>
-                Selection Filter
-              </div>
-              <SelectToggle label="Nodes" kind="node" selectableKinds={selectableKinds} toggle={toggleSelectable} />
-              <SelectToggle label="Edges" kind="edge" selectableKinds={selectableKinds} toggle={toggleSelectable} />
-              <SelectToggle label="Objects" kind="object" selectableKinds={selectableKinds} toggle={toggleSelectable} />
-
-
-            </div>
-          </>
-        )}
-
         {editMode === "edit" && (
           <div
             style={{
@@ -3127,9 +3184,8 @@ function SelectToggle({
         display: "flex",
         alignItems: "center",
         gap: 8,
-        padding: "2px 0",
+        padding: "5px 0",
         cursor: "pointer",
-        fontSize: 13,
       }}
     >
       <input
@@ -3162,7 +3218,7 @@ function Toggle({
         display: "flex",
         alignItems: "center",
         gap: 8,
-        padding: "2px 0",
+        padding: "5px 0",
         cursor: "pointer",
       }}
     >

@@ -647,6 +647,9 @@ export function BBoxMode() {
   const saveChainRef = useRef<Promise<void>>(Promise.resolve());
   const enqueueSave = useCallback(
     (name: string, list: BBoxItem[]) => {
+      // No active asset (the "None" scene selection, or an unresolved one):
+      // there is no file to annotate, so there is nothing to persist.
+      if (!name) return Promise.resolve();
       // Capture the scene at enqueue time: the chained POST runs async and
       // must persist into the scene the edits were made in, even if the
       // user has already switched to another one.
@@ -756,6 +759,17 @@ export function BBoxMode() {
   // Keyed on [activeName, scene]: two scenes may hold an asset with the
   // same file name, so the scene alone must re-trigger the load too.
   useEffect(() => {
+    // No active asset (the "None" scene selection, or an unresolved one):
+    // nothing is rendered, so the previous asset's boxes must not stay on
+    // screen — their handles would annotate a file that isn't displayed.
+    if (!activeName) {
+      setBoxes([]);
+      setActiveId(null);
+      setDraftMin(null);
+      historyRef.current = [];
+      dirtyRef.current = false;
+      return;
+    }
     if (!scene) return;
     let cancelled = false;
     (async () => {
@@ -949,7 +963,10 @@ export function BBoxMode() {
 
   const handleSave = useCallback(async () => {
     // An empty list is a valid save: it clears previously saved boxes for
-    // this asset (the backend writes `{ name, boxes: [] }`).
+    // this asset (the backend writes `{ name, boxes: [] }`). With NO active
+    // asset ("None" scene selection / unresolved) there is no file to write,
+    // so `enqueueSave` is a no-op — reporting "saved" for it would be a lie.
+    if (!activeNameRef.current) return;
     setSaveState("saving");
     try {
       await enqueueSave(activeNameRef.current, boxesRef.current);
@@ -1094,6 +1111,7 @@ export function BBoxMode() {
           size={size}
           saveState={saveState}
           copied={copied}
+          hasAsset={!!activeName}
           onSetMin={handleSetMin}
           onSetMax={handleSetMax}
           onBeginEdit={beginPanelEdit}

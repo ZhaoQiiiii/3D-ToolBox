@@ -37,11 +37,18 @@ export function useScene(): {
   scenes: string[];
   scene: string;
   setScene: (scene: string) => void;
+  scenesLoaded: boolean;
 } {
   const [scenes, setScenes] = useState<string[]>(() => scenesCache ?? []);
   const [scene, setSceneState] = useState<string>(
     () => readSceneFromHash() ?? localStorage.getItem(LS_KEY) ?? "",
   );
+  // Whether the /api/scenes request has SETTLED (resolved or failed) — not
+  // whether it succeeded. While it is in flight `scene` may legitimately be
+  // "" and consumers must keep waiting; once it settles, "" means "there is
+  // no scene to select", which they must not wait on forever. Failures are
+  // reported on the console above, so they still count as settled.
+  const [scenesLoaded, setScenesLoaded] = useState(() => scenesCache !== null);
 
   useEffect(() => {
     let cancelled = false;
@@ -52,8 +59,12 @@ export function useScene(): {
         const names = ((j.scenes || []) as { name: string }[]).map((s) => s.name);
         scenesCache = names;
         setScenes(names);
+        setScenesLoaded(true);
       })
-      .catch((e) => console.warn("Failed to list scenes:", e));
+      .catch((e) => {
+        console.warn("Failed to list scenes:", e);
+        if (!cancelled) setScenesLoaded(true);
+      });
     return () => {
       cancelled = true;
     };
@@ -76,5 +87,5 @@ export function useScene(): {
     }
   }, []);
 
-  return { scenes, scene, setScene };
+  return { scenes, scene, setScene, scenesLoaded };
 }

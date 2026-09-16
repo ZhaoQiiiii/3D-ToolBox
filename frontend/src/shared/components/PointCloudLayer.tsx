@@ -12,13 +12,24 @@ interface Props {
   opacity?: number;
 }
 
+/**
+ * Display names of the colour-scheme selector. The KEYS stay untouched on
+ * purpose: they are persisted in localStorage, so renaming one would silently
+ * invalidate a saved selection.
+ *
+ * `xray` / `yray` are NOT x-ray / see-through modes — they run the same jet
+ * ramp as `rainbow`, only keyed on the X / Y axis — so they are labelled after
+ * the axis they actually encode instead of keeping the misleading names.
+ * `flat` draws the cloud in one fixed colour (the loader only reads XYZ, there
+ * are no per-point colours to fall back to), hence not "object colour".
+ */
 const SCHEME_LABELS: Record<PcdColorScheme, string> = {
-  flat: "Flat (object color)",
+  flat: "Flat (fixed color)",
   rainbow: "Rainbow (Z height)",
-  coolwarm: "Cool-Warm (Z)",
-  gray: "Grayscale (Z)",
-  xray: "X-Ray (X axis)",
-  yray: "Y-Ray (Y axis)",
+  coolwarm: "Cool-Warm (Z height)",
+  gray: "Grayscale (Z height)",
+  xray: "Rainbow (X axis)",
+  yray: "Rainbow (Y axis)",
 };
 
 export { SCHEME_LABELS };
@@ -66,7 +77,21 @@ export const PointCloudLayer = forwardRef<THREE.Points, Props>(
           )}
         </bufferGeometry>
         <pointsMaterial
-          color={colors ? undefined : colorHex}
+          // `vertexColors` decides the shader program, and three.js only
+          // recompiles a material when `material.version` changes — flipping
+          // the flag on an existing material is NOT detected (the renderer's
+          // needsProgramChange checks vertexAlphas/vertexTangents, not
+          // vertexColors, and R3F never bumps needsUpdate for prop updates).
+          // A stale program therefore either ignores the colour attribute
+          // (Flat → any scheme: the map silently does nothing) or keeps
+          // reading an attribute that is gone (any scheme → Flat: the points
+          // turn black). Giving the material a new identity per state forces
+          // the fresh compile in both directions.
+          key={colors ? "vertex-colors" : "flat"}
+          // Explicit white: with `vertexColors` the shader multiplies the
+          // vertex colour by this one, and R3F ignores `undefined` props, so
+          // omitting it would keep the previous flat colour and tint the map.
+          color={colors ? "#ffffff" : colorHex}
           size={pointSize}
           sizeAttenuation
           transparent

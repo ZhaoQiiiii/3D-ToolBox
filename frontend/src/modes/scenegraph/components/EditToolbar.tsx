@@ -7,6 +7,13 @@ interface Props {
   exporting: boolean;
   showDiff: boolean;
   showShortcuts: boolean;
+  /**
+   * A scene graph is actually loaded (a snapshot was picked and fetched). The
+   * Add Node / Add Object buttons create mutations that can only ever be
+   * exported against a snapshot, so with none loaded they are disabled instead
+   * of letting the user build edits whose Export silently does nothing.
+   */
+  hasGraph: boolean;
   /** Short-lived status message (e.g. "Undo applied"), pinned to the right. */
   notice?: string | null;
   onToggleEdit: () => void;
@@ -26,6 +33,7 @@ export function EditToolbar({
   exporting,
   showDiff,
   showShortcuts,
+  hasGraph,
   notice,
   onToggleEdit,
   onReset,
@@ -77,11 +85,29 @@ export function EditToolbar({
         <>
           <span style={{ color: "#888" }}>|</span>
 
-          <button onClick={onAddNode} style={btnStyle} title="Add a new node at arbitrary XYZ">
+          <button
+            onClick={onAddNode}
+            disabled={!hasGraph}
+            style={hasGraph ? btnStyle : btnDisabledStyle}
+            title={
+              hasGraph
+                ? "Add a new node at arbitrary XYZ"
+                : "No scene graph loaded — pick a Snapshot first"
+            }
+          >
             Add Node
           </button>
 
-          <button onClick={onAddObject} style={btnStyle} title="Add a new marker object at arbitrary XYZ">
+          <button
+            onClick={onAddObject}
+            disabled={!hasGraph}
+            style={hasGraph ? btnStyle : btnDisabledStyle}
+            title={
+              hasGraph
+                ? "Add a new marker object at arbitrary XYZ"
+                : "No scene graph loaded — pick a Snapshot first"
+            }
+          >
             Add Object
           </button>
 
@@ -104,11 +130,7 @@ export function EditToolbar({
           <button
             onClick={onExport}
             disabled={!dirty || exporting}
-            style={{
-              ...btnStyle,
-              opacity: dirty && !exporting ? 1 : 0.4,
-              cursor: dirty && !exporting ? "pointer" : "not-allowed",
-            }}
+            style={dirty && !exporting ? btnStyle : btnDisabledStyle}
           >
             {exporting ? "Exporting..." : "Export"}
           </button>
@@ -155,4 +177,10 @@ const btnActiveStyle: React.CSSProperties = {
   background: "rgba(52,152,219,0.3)",
   border: "1px solid rgba(52,152,219,0.5)",
   color: "#3498db",
+};
+
+const btnDisabledStyle: React.CSSProperties = {
+  ...btnStyle,
+  opacity: 0.4,
+  cursor: "not-allowed",
 };

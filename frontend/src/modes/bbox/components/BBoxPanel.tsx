@@ -2,29 +2,17 @@ import { useEffect, useRef, useState } from "react";
 import type { BBoxItem, Vec3 } from "../lib/bbox";
 import { colorForIndex } from "../lib/bbox";
 
-const SLIDER_RANGES: Record<"x" | "y" | "z", [number, number]> = {
+const AXIS_RANGES: Record<"x" | "y" | "z", [number, number]> = {
   x: [-30.0, 50.0],
   y: [-30.0, 50.0],
   z: [-10.0, 20.0],
 };
-const SLIDER_RES = 0.01;
+const AXIS_STEP = 0.01;
 
 function roundTo(n: number, decimals: number) {
   const f = Math.pow(10, decimals);
   return Math.round(n * f) / f;
 }
-
-const rangeStyle: React.CSSProperties = {
-  width: 170,
-  accentColor: "#3498db",
-  height: 4,
-};
-
-const rangeStyleCompact: React.CSSProperties = {
-  width: 64,
-  accentColor: "#3498db",
-  height: 4,
-};
 
 interface Props {
   boxes: BBoxItem[];
@@ -36,6 +24,13 @@ interface Props {
   size: Vec3 | null;
   saveState: "idle" | "saving" | "saved" | "error";
   copied: boolean;
+  /**
+   * There IS an active asset to annotate: the user did not pick the "None"
+   * scene file and the selection resolved. Boxes only ever persist against the
+   * active asset, so with none the annotate/save buttons are disabled instead
+   * of letting the user build boxes that can never be written to disk.
+   */
+  hasAsset: boolean;
   onSetMin: (v: Vec3) => void;
   onSetMax: (v: Vec3) => void;
   onBeginEdit: () => void;
@@ -69,13 +64,11 @@ function VecEditor({
   value,
   onChange,
   onBeginEdit,
-  compact = false,
 }: {
   label: string;
   value: Vec3;
   onChange: (v: Vec3) => void;
   onBeginEdit: () => void;
-  compact?: boolean;
 }) {
   const setAxis = (axis: "x" | "y" | "z", n: number) => {
     const next: Vec3 = [...value];
@@ -93,7 +86,7 @@ function VecEditor({
     <div style={{ marginTop: 8 }}>
       <div style={{ color: "#fff", fontWeight: 600, marginBottom: 2 }}>{label}</div>
       {axes.map(({ key, idx }) => {
-        const [min, max] = SLIDER_RANGES[key];
+        const [min, max] = AXIS_RANGES[key];
         return (
           <div
             key={key}
@@ -105,22 +98,12 @@ function VecEditor({
                 value={value[idx]!}
                 min={min}
                 max={max}
-                step={SLIDER_RES}
+                step={AXIS_STEP}
                 clamp={false}
                 onChange={(n) => setAxis(key, n)}
                 onBegin={onBeginEdit}
               />
             </div>
-            <input
-              type="range"
-              min={min}
-              max={max}
-              step={SLIDER_RES}
-              value={value[idx]!}
-              onChange={(e) => setAxis(key, Number(e.target.value))}
-              onPointerDown={onBeginEdit}
-              style={compact ? rangeStyleCompact : rangeStyle}
-            />
           </div>
         );
       })}
@@ -237,6 +220,7 @@ export function BBoxPanel({
   size,
   saveState,
   copied,
+  hasAsset,
   onSetMin,
   onSetMax,
   onBeginEdit,
@@ -250,7 +234,7 @@ export function BBoxPanel({
 }: Props) {
   return (
     <div data-overlay style={PANEL_STYLE}>
-      <div style={{ color: "#fff", fontWeight: 700, fontSize: 15 }}>3D-ToolBox</div>
+      <div style={{ color: "#fff", fontWeight: 700, fontSize: 15 }}>3D BBox</div>
 
       <div style={{ marginTop: 12, borderTop: "1px solid #333", paddingTop: 8 }}>
         <div style={{ color: "#fff", fontWeight: 700, fontSize: 14, marginBottom: 6 }}>
@@ -311,6 +295,8 @@ export function BBoxPanel({
         <button
           type="button"
           onClick={onNewBox}
+          disabled={!hasAsset}
+          title={hasAsset ? undefined : "No scene file loaded — pick one above"}
           style={{
             width: "100%",
             marginTop: 8,
@@ -319,7 +305,8 @@ export function BBoxPanel({
             border: "1px solid #3498db",
             borderRadius: 4,
             padding: "6px 0",
-            cursor: "pointer",
+            cursor: hasAsset ? "pointer" : "not-allowed",
+            opacity: hasAsset ? 1 : 0.4,
             fontFamily: "monospace",
             fontSize: 13,
           }}
@@ -336,14 +323,12 @@ export function BBoxPanel({
               value={cornerMin}
               onChange={onSetMin}
               onBeginEdit={onBeginEdit}
-              compact
             />
             <VecEditor
               label="corner_max"
               value={cornerMax}
               onChange={onSetMax}
               onBeginEdit={onBeginEdit}
-              compact
             />
           </div>
         )}
@@ -369,10 +354,14 @@ export function BBoxPanel({
           <button
             type="button"
             onClick={onSave}
+            disabled={!hasAsset}
+            title={hasAsset ? undefined : "No scene file loaded — nothing to save"}
             style={
-              saveState === "error"
-                ? { ...btnStyle, color: "#ff6b6b", borderColor: "#ff6b6b" }
-                : btnStyle
+              !hasAsset
+                ? btnDisabledStyle
+                : saveState === "error"
+                  ? { ...btnStyle, color: "#ff6b6b", borderColor: "#ff6b6b" }
+                  : btnStyle
             }
           >
             {saveState === "saving"
@@ -412,6 +401,12 @@ const btnStyle: React.CSSProperties = {
   cursor: "pointer",
   fontFamily: "monospace",
   fontSize: 12,
+};
+
+const btnDisabledStyle: React.CSSProperties = {
+  ...btnStyle,
+  opacity: 0.4,
+  cursor: "not-allowed",
 };
 
 const stepperBtnStyle: React.CSSProperties = {

@@ -68,6 +68,15 @@ let sceneSelectionState: SceneSelectionState = {
   selectedSplat: null,
 };
 
+/**
+ * Sentinel for the "None" entry of the scene-asset selectors: the user
+ * explicitly chose to render no asset for that render mode. It must be
+ * distinguishable from "" / null, because the stale-selection fallbacks
+ * below auto-pick the first file whenever the selection is empty — without
+ * the sentinel an explicit "None" would be overwritten on the next render.
+ */
+export const NO_ASSET = "__none__";
+
 const sceneSelectionListeners = new Set<() => void>();
 
 function setSceneSelection(patch: Partial<SceneSelectionState>) {
@@ -115,7 +124,7 @@ const SCENE_PCD_MAX_POINTS = 2_000_000;
 
 export function useSceneAssets(options?: UseSceneAssetsOptions) {
   // ---- scene bucket ----
-  const { scenes, scene, setScene } = useScene();
+  const { scenes, scene, setScene, scenesLoaded } = useScene();
 
   // ---- asset listing of the active scene ----
   const {
@@ -158,8 +167,10 @@ export function useSceneAssets(options?: UseSceneAssetsOptions) {
 
   // Stale-selection fallback: a file that disappears from (or never was in)
   // the listing would 404 — fall back to the first available file. This
-  // also picks the initial selection once the listing arrives.
+  // also picks the initial selection once the listing arrives. An explicit
+  // "None" is a real choice, not a stale selection, so it is left alone.
   useEffect(() => {
+    if (selectedCloud === NO_ASSET) return;
     if (cloudFiles.length > 0 && !cloudFiles.includes(selectedCloud)) {
       setSceneSelection({ selectedCloud: cloudFiles[0]! });
     }
@@ -172,6 +183,7 @@ export function useSceneAssets(options?: UseSceneAssetsOptions) {
   // the persisted selection and blank the 3DGS view for no reason.
   useEffect(() => {
     if (!listingLoaded) return;
+    if (selectedSplat === NO_ASSET) return;
     if (splatFiles.length === 0) {
       if (selectedSplat !== null) setSceneSelection({ selectedSplat: null });
       return;
@@ -249,8 +261,11 @@ export function useSceneAssets(options?: UseSceneAssetsOptions) {
   );
 
   // ---- the active asset (per render mode) ----
-  const activeName =
+  // "None" is a NO_ASSET sentinel, not a file name: it resolves to "" so the
+  // whole active-asset pipeline (format/url/loading) sees "nothing to render".
+  const activeRaw =
     renderMode === "pointcloud" ? selectedCloud : (selectedSplat ?? "");
+  const activeName = activeRaw === NO_ASSET ? "" : activeRaw;
   const activeFormat = activeName ? detectCloudFormat(activeName) : null;
   const activeUrl =
     activeName && scene
@@ -273,9 +288,9 @@ export function useSceneAssets(options?: UseSceneAssetsOptions) {
   const [cloudError, setCloudError] = useState<string | null>(null);
 
   useEffect(() => {
-    // No selection / unresolved scene: nothing to render — drop the previous
-    // scene's points so they can't bleed into the new scene's view.
-    if (!selectedCloud || !scene) {
+    // No selection / explicit "None" / unresolved scene: nothing to render —
+    // drop the previous scene's points so they can't bleed into the view.
+    if (!selectedCloud || selectedCloud === NO_ASSET || !scene) {
       setPositions(null);
       setCloudLoading(false);
       setCloudError(null);
@@ -335,6 +350,9 @@ export function useSceneAssets(options?: UseSceneAssetsOptions) {
     scenes,
     scene,
     selectScene,
+    // true once the /api/scenes listing settled — lets a mode stop waiting
+    // when `scene` resolves to "" because there is no scene at all
+    scenesLoaded,
     // listings
     cloudFiles,
     splatFiles,

@@ -31,8 +31,9 @@ export function useSceneVisuals() {
     "showAxes",
     true,
   );
-  // Point-cloud color scheme (flat / Z-height / X-ray …) shared by all three
-  // modes — the "按高度着色" schemes (rainbow/coolwarm/gray) live here.
+  // Point-cloud color scheme shared by all three modes — one fixed color plus
+  // the axis-keyed ramps (Z height: rainbow/coolwarm/gray; X / Y axis:
+  // xray/yray).
   const [colorScheme, setColorScheme] = useSceneVisualsState<PcdColorScheme>(
     "colorScheme",
     "flat",
