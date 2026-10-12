@@ -53,8 +53,8 @@ export function AddObjectPanel({ onAdd, onCancel, initialPosition }: Props) {
   }, [label, x, y, z, colorHex, onAdd]);
 
   const coordInput: React.CSSProperties = {
-    flex: 1,
-    minWidth: 0,
+    width: 76,
+    boxSizing: "border-box",
     background: "#1a1a2e",
     color: "#eee",
     border: "1px solid #3498db",
@@ -130,7 +130,7 @@ function AxisField({
   style: React.CSSProperties;
 }) {
   return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 3 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 3, width: 76 }}>
       <span style={{ color: "#3498db", fontWeight: 600, fontSize: 11 }}>{axis}</span>
       <input
         type="number"
