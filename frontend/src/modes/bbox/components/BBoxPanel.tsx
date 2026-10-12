@@ -277,6 +277,21 @@ export function BBoxPanel({
                 placeholder="label"
                 style={labelInputStyle}
               />
+              {box.objectId != null && (
+                <span
+                  style={{
+                    color: "#7fd4ff",
+                    fontSize: 10,
+                    fontFamily: "monospace",
+                    whiteSpace: "nowrap",
+                    flexShrink: 0,
+                    cursor: "pointer",
+                  }}
+                  title={`已关联场景图 object ${box.objectId}（SceneGraph Editor 中设置）`}
+                >
+                  → {box.objectLabel ?? "?"} [{box.objectId}]
+                </span>
+              )}
               <button
                 type="button"
                 aria-label="delete"

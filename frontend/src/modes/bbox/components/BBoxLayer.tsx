@@ -26,17 +26,22 @@ interface Props {
 
 const UP = new THREE.Vector3(0, 1, 0);
 
-/** A visible box edge (thin cylinder, display only). */
-function EdgeCylinder({
+/** A visible box edge (thin cylinder, display only). Exported for the
+ *  SceneGraph read-only overlay, which renders the same look. */
+export function EdgeCylinder({
   start,
   end,
   radius,
   color,
+  raycast,
 }: {
   start: Vec3;
   end: Vec3;
   radius: number;
   color: string;
+  /** Optional raycast override — the silent overlay passes a no-op so the
+   *  cylinders can never intercept picks. */
+  raycast?: () => void;
 }) {
   const av = new THREE.Vector3(start[0], start[1], start[2]);
   const bv = new THREE.Vector3(end[0], end[1], end[2]);
@@ -46,7 +51,7 @@ function EdgeCylinder({
   const quaternion = new THREE.Quaternion().setFromUnitVectors(UP, dir.normalize());
 
   return (
-    <mesh position={mid} quaternion={quaternion}>
+    <mesh position={mid} quaternion={quaternion} raycast={raycast}>
       <cylinderGeometry args={[radius, radius, length, 8]} />
       <meshBasicMaterial color={color} />
     </mesh>

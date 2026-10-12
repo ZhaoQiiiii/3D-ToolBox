@@ -26,6 +26,9 @@ export interface BBoxItem {
   label: string;
   min: Vec3;
   max: Vec3;
+  /** Associated scene-graph object (set via SceneGraph Editor). null = unassociated. */
+  objectId?: number | null;
+  objectLabel?: string | null;
 }
 
 /** Per-object colour palette; boxes are tinted by their creation order. */
@@ -102,6 +105,8 @@ export interface BBoxOutput extends BboxResult {
   label: string;
   min: Vec3;
   max: Vec3;
+  object_id: number | null;
+  object_label: string | null;
 }
 
 export function toBBoxOutput(box: BBoxItem): BBoxOutput {
@@ -110,6 +115,8 @@ export function toBBoxOutput(box: BBoxItem): BBoxOutput {
     label: box.label,
     min: box.min,
     max: box.max,
+    object_id: box.objectId ?? null,
+    object_label: box.objectLabel ?? null,
     ...toBboxResult(box.min, box.max),
   };
 }
@@ -183,4 +190,98 @@ export function toBboxResult(min: Vec3, max: Vec3): BboxResult {
 /** The exact JSON line the old script printed. */
 export function formatBboxJson(min: Vec3, max: Vec3): string {
   return JSON.stringify(toBboxResult(min, max));
+}
+
+/**
+ * Rebuild a labelled-box list from the backend payload (new or legacy shape):
+ * `{boxes: [...]}`, a single `{min, max}` box, or a single
+ * `{center_x, ..., size_z}` box. Shared by the BBox Anno mode (editing) and
+ * the SceneGraph mode (read-only overlay) so both parse identically.
+ */
+export function parseBoxes(data: any): BBoxItem[] {
+  if (Array.isArray(data.boxes)) {
+    const out: BBoxItem[] = [];
+    for (const b of data.boxes) {
+      if (Array.isArray(b?.min) && Array.isArray(b?.max) && b.min.length === 3 && b.max.length === 3) {
+        out.push({
+          id: typeof b.id === "string" ? b.id : newBBoxId(),
+          label: typeof b.label === "string" ? b.label : "object",
+          min: [b.min[0], b.min[1], b.min[2]] as Vec3,
+          max: [b.max[0], b.max[1], b.max[2]] as Vec3,
+          objectId: typeof b.object_id === "number" ? b.object_id : null,
+          objectLabel: typeof b.object_label === "string" ? b.object_label : null,
+        });
+      }
+    }
+    return out;
+  }
+
+  if (Array.isArray(data.min) && Array.isArray(data.max) && data.min.length === 3 && data.max.length === 3) {
+    return [
+      {
+        id: newBBoxId(),
+        label: "object",
+        min: [data.min[0], data.min[1], data.min[2]] as Vec3,
+        max: [data.max[0], data.max[1], data.max[2]] as Vec3,
+      },
+    ];
+  }
+
+  if (typeof data.center_x === "number" && typeof data.size_x === "number") {
+    return [
+      {
+        id: newBBoxId(),
+        label: "object",
+        min: [
+          data.center_x - data.size_x / 2,
+          data.center_y - data.size_y / 2,
+          data.center_z - data.size_z / 2,
+        ] as Vec3,
+        max: [
+          data.center_x + data.size_x / 2,
+          data.center_y + data.size_y / 2,
+          data.center_z + data.size_z / 2,
+        ] as Vec3,
+      },
+    ];
+  }
+
+  return [];
+}
+
+/**
+ * Copy output in the BBOX_PRESETS format consumed by VLA_Diff's orbit planner
+ * (orbit_planner_scene_graph7.py): the full Python dict with one entry per
+ * box. Associated boxes are keyed by their object id; unassociated boxes fall
+ * back to the numeric part of an "object_N" label (list index otherwise). All
+ * boxes are copied at once. Centers/sizes use the same Z-up local frame,
+ * fixed 3 decimals.
+ *
+ * Keys must be unique — Python silently drops duplicate dict keys — but an
+ * unassociated box's placeholder key can collide with an associated object id
+ * (e.g. object_N label N === object id N). Associated ids are the values the
+ * planner indexes by, so they stay fixed; placeholder keys are bumped past
+ * every collision.
+ */
+export function formatBboxPresets(boxes: BBoxItem[]): string {
+  const used = new Set<number>();
+  for (const b of boxes) {
+    if (b.objectId != null) used.add(b.objectId);
+  }
+  const entries = boxes.map((b, index) => {
+    const mm = /^object_(\d+)$/.exec(b.label);
+    let key = b.objectId != null ? b.objectId : mm ? Number(mm[1]) : index;
+    if (b.objectId == null) {
+      while (used.has(key)) key += 1;
+      used.add(key);
+    }
+    const r = toBboxResult(b.min, b.max);
+    const f = (v: number) => v.toFixed(3);
+    const entry =
+      `    ${key}: {"center_x": ${f(r.center_x)}, "center_y": ${f(r.center_y)}, "center_z": ${f(r.center_z)}, ` +
+      `"size_x": ${f(r.size_x)}, "size_y": ${f(r.size_y)}, "size_z": ${f(r.size_z)}}`;
+    // The trailing comment is Python-valid only AFTER the comma.
+    return b.objectId != null ? `${entry},  # ${b.objectLabel ?? ""}` : `${entry},`;
+  });
+  return `BBOX_PRESETS = {\n${entries.join("\n")}\n}`;
 }

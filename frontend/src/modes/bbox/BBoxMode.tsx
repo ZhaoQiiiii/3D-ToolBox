@@ -6,8 +6,10 @@ import * as THREE from "three";
 import type { BBoxItem, DragEntry, Vec3 } from "./lib/bbox";
 import {
   colorForIndex,
+  formatBboxPresets,
   moveCornerTo,
   newBBoxId,
+  parseBoxes,
   toBBoxOutput,
   toBboxResult,
   vecMin,
@@ -21,6 +23,10 @@ import type { DropInViewer } from "@mkkellogg/gaussian-splats-3d";
 import { BBoxLayer } from "./components/BBoxLayer";
 import { BBoxPanel } from "./components/BBoxPanel";
 import { CameraControls } from "./components/CameraControls";
+import {
+  FlyWheelController,
+  LookRotateController,
+} from "../../shared/fly-camera-controllers";
 import { type SplatFormat } from "../../shared/splat-format";
 import {
   MODE_PANEL_STYLE,
@@ -43,56 +49,6 @@ import {
 } from "../../shared/lib/projection";
 
 type RenderMode = "pointcloud" | "3dgs";
-
-/** Rebuild a labelled-box list from the backend payload (new or legacy shape). */
-function parseBoxes(data: any): BBoxItem[] {
-  if (Array.isArray(data.boxes)) {
-    const out: BBoxItem[] = [];
-    for (const b of data.boxes) {
-      if (Array.isArray(b?.min) && Array.isArray(b?.max) && b.min.length === 3 && b.max.length === 3) {
-        out.push({
-          id: typeof b.id === "string" ? b.id : newBBoxId(),
-          label: typeof b.label === "string" ? b.label : "object",
-          min: [b.min[0], b.min[1], b.min[2]] as Vec3,
-          max: [b.max[0], b.max[1], b.max[2]] as Vec3,
-        });
-      }
-    }
-    return out;
-  }
-
-  if (Array.isArray(data.min) && Array.isArray(data.max) && data.min.length === 3 && data.max.length === 3) {
-    return [
-      {
-        id: newBBoxId(),
-        label: "object",
-        min: [data.min[0], data.min[1], data.min[2]] as Vec3,
-        max: [data.max[0], data.max[1], data.max[2]] as Vec3,
-      },
-    ];
-  }
-
-  if (typeof data.center_x === "number" && typeof data.size_x === "number") {
-    return [
-      {
-        id: newBBoxId(),
-        label: "object",
-        min: [
-          data.center_x - data.size_x / 2,
-          data.center_y - data.size_y / 2,
-          data.center_z - data.size_z / 2,
-        ] as Vec3,
-        max: [
-          data.center_x + data.size_x / 2,
-          data.center_y + data.size_y / 2,
-          data.center_z + data.size_z / 2,
-        ] as Vec3,
-      },
-    ];
-  }
-
-  return [];
-}
 
 // ---- picker (raw canvas pointer events) ----
 
@@ -551,6 +507,10 @@ function Scene({
 
       <SceneGrid size={gridSize} />
       <CameraControls ref={controlsRef} />
+      {/* Shared fly/look navigation — identical cursor behavior across all
+          three modes (see shared/fly-camera-controllers.tsx). */}
+      <FlyWheelController controlsRef={controlsRef} />
+      <LookRotateController controlsRef={controlsRef} />
       <Picker
         sceneGroupRef={sceneGroupRef}
         controlsRef={controlsRef}
@@ -951,15 +911,17 @@ export function BBoxMode() {
   }, []);
 
   const handleCopy = useCallback(async () => {
-    if (!json) return;
+    if (boxes.length === 0) return;
     try {
-      await navigator.clipboard.writeText(json);
+      // BBOX_PRESETS format (orbit_planner_scene_graph7.py): id → center/size
+      // entry, one line per box, label as trailing comment.
+      await navigator.clipboard.writeText(formatBboxPresets(boxes));
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
     } catch {
       setCopied(false);
     }
-  }, [json]);
+  }, [boxes]);
 
   const handleSave = useCallback(async () => {
     // An empty list is a valid save: it clears previously saved boxes for

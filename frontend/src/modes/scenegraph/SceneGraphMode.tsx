@@ -1,7 +1,7 @@
 import { useEffect, useState, useMemo, useCallback, useRef } from "react";
 import type { CSSProperties, RefObject } from "react";
 import { useThree } from "@react-three/fiber";
-import { OrbitControls, PerspectiveCamera } from "@react-three/drei";
+import { Html, OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import * as THREE from "three";
 import { AreaBox } from "./components/AreaBoxes";
 import { AreaEdges } from "./components/AreaEdges";
@@ -35,7 +35,22 @@ import { createLocalStorageHook } from "../../shared/use-local-storage";
 import { useSceneAssets } from "../../shared/use-scene-assets";
 import { useCanvasSlot } from "../../shared/canvas-slot";
 import { useSceneCameraPose } from "../../shared/use-scene-camera";
+import {
+  FlyWheelController,
+  LookRotateController,
+} from "../../shared/fly-camera-controllers";
 import { useSceneVisuals } from "../../shared/use-scene-visuals";
+import {
+  colorForIndex,
+  cornerPositions,
+  formatBboxPresets,
+  boxEdges,
+  MIN_EDGE_RADIUS,
+  parseBoxes,
+  toBBoxOutput,
+} from "../bbox/lib/bbox";
+import type { BBoxItem } from "../bbox/lib/bbox";
+import { EdgeCylinder } from "../bbox/components/BBoxLayer";
 import { loadSceneGraph } from "./lib/scene-loader";
 import { logEvent } from "./lib/logger";
 import { pickTarget } from "./lib/picking";
@@ -66,6 +81,7 @@ import {
   addUpdateObjectId,
   addDeleteObject,
   addCreatePoly,
+  isPendingCreatePoly,
   addCreateObject,
   addUpdateObjectOrder,
   addUpdateArea,
@@ -193,6 +209,18 @@ function makeSyntheticNode(
   return { id, areaId, position: center, colorHex: "#3498db" };
 }
 
+/**
+ * Pre-assign the real poly id for the next created node: max over loaded ids
+ * and already-pre-assigned pending ids, plus one. The backend honors this id
+ * at export (see applyCreatePolys), so the node can be connected immediately.
+ */
+function nextPolyId(loadedNodes: TopologicalNode[], m: Mutations): number {
+  let max = 0;
+  for (const n of loadedNodes) max = Math.max(max, n.id);
+  for (const cp of m.createPoly) max = Math.max(max, cp.id);
+  return max + 1;
+}
+
 /** Convert an RGB color in 0–1 floats to a `#rrggbb` hex string. */
 function rgb01ToHex(rgb: [number, number, number]): string {
   const t = (x: number) =>
@@ -236,11 +264,12 @@ function effectiveNodes(
       return n;
     });
 
-  // Synthesise display nodes for pending createPoly mutations
-  let tempId = -1;
+  // Synthesise display nodes for pending createPoly mutations. Each entry
+  // already carries its pre-assigned real poly id, so the node renders — and
+  // can be connected — with the id it will keep after export.
   const created: TopologicalNode[] = [];
   for (const cp of m.createPoly) {
-    created.push(makeSyntheticNode(cp.center as [number, number, number], cp.areaId, tempId--));
+    created.push(makeSyntheticNode(cp.center as [number, number, number], cp.areaId, cp.id));
   }
 
   return [...existing, ...created];
@@ -926,150 +955,203 @@ function CameraFocusController({
   return null;
 }
 
-/**
- * Fly-style wheel navigation: scrolling translates the camera along its view
- * direction (the orbit pivot moves with it) instead of OrbitControls' dolly
- * toward a fixed target. No min/max distance limits — you can fly through
- * the scene. OrbitControls still owns rotate/pan; its own zoom is disabled.
- */
-function FlyWheelController({
-  controlsRef,
-}: {
-  controlsRef: RefObject<any>;
-}) {
-  const { gl, camera } = useThree();
-
-  useEffect(() => {
-    const canvas = gl.domElement;
-    const forward = new THREE.Vector3();
-
-    const onWheel = (e: WheelEvent) => {
-      const controls = controlsRef.current;
-      if (!controls) return;
-      e.preventDefault();
-      e.stopImmediatePropagation();
-
-      // Wheel deltas arrive in pixels (mode 0), lines (1) or pages (2).
-      let dy = e.deltaY;
-      if (e.deltaMode === 1) dy *= 16;
-      else if (e.deltaMode === 2) dy *= 100;
-
-      // Step scales with the camera→pivot distance: fast when far away,
-      // fine-grained up close. Floor of 2 keeps movement alive when the
-      // pivot is (almost) at the camera.
-      camera.getWorldDirection(forward);
-      const dist = camera.position.distanceTo(controls.target);
-      const step = -dy * 0.0002 * Math.max(dist, 2);
-      forward.multiplyScalar(step);
-      camera.position.add(forward);
-      controls.target.add(forward);
-      controls.update();
-    };
-
-    canvas.addEventListener("wheel", onWheel, { passive: false });
-    return () => canvas.removeEventListener("wheel", onWheel);
-  }, [gl, camera, controlsRef]);
-
-  return null;
-}
-
-/**
- * FPS-style look-around: left-drag rotates the view in place (camera position
- * fixed, the orbit pivot rotates with the view direction) instead of orbiting
- * around the pivot. Entity dragging keeps priority: ClickHandler disables
- * OrbitControls for the gesture, and rotation is skipped while controls are
- * disabled. Plain left clicks still reach ClickHandler (select / pick).
- */
-function LookRotateController({
-  controlsRef,
-  rotateSpeed = 1.5,
-}: {
-  controlsRef: RefObject<any>;
-  rotateSpeed?: number;
-}) {
-  const { gl, camera } = useThree();
-
-  useEffect(() => {
-    const canvas = gl.domElement;
-    let active = false;
-    let lastX = 0;
-    let lastY = 0;
-    const offset = new THREE.Vector3();
-    const right = new THREE.Vector3();
-    const UP = new THREE.Vector3(0, 1, 0);
-
-    // OrbitControls must not also orbit on left-drag (touch keeps ROTATE).
-    const controls0 = controlsRef.current;
-    if (controls0) (controls0.mouseButtons as Record<string, number>).LEFT = -1;
-
-    const onPointerDown = (e: PointerEvent) => {
-      if (e.button !== 0 || e.pointerType !== "mouse") return;
-      const controls = controlsRef.current;
-      if (!controls || !controls.enabled) return;
-      active = true;
-      lastX = e.clientX;
-      lastY = e.clientY;
-    };
-
-    const onPointerMove = (e: PointerEvent) => {
-      if (!active) return;
-      const controls = controlsRef.current;
-      // ClickHandler disables controls when an entity drag begins — bail out
-      // so nodes/objects keep dragging instead of rotating the camera.
-      if (!controls || !controls.enabled) {
-        active = false;
-        return;
-      }
-      const dx = e.clientX - lastX;
-      const dy = e.clientY - lastY;
-      lastX = e.clientX;
-      lastY = e.clientY;
-      if (dx === 0 && dy === 0) return;
-
-      // Same direction mapping as OrbitControls: drag right → look right,
-      // drag down → look down.
-      const yaw = (-2 * Math.PI * dx * rotateSpeed) / canvas.clientHeight;
-      const pitch = (-2 * Math.PI * dy * rotateSpeed) / canvas.clientHeight;
-
-      // Rotate the pivot offset about the fixed camera position.
-      offset.copy(controls.target).sub(camera.position);
-      offset.applyAxisAngle(UP, yaw);
-      right.crossVectors(offset, UP);
-      if (right.lengthSq() > 1e-8) {
-        right.normalize();
-        const beforeX = offset.x;
-        const beforeY = offset.y;
-        const beforeZ = offset.z;
-        offset.applyAxisAngle(right, pitch);
-        // Clamp near the poles so the view can't flip over zenith/nadir.
-        if (Math.abs(offset.y / offset.length()) > 0.995) {
-          offset.set(beforeX, beforeY, beforeZ);
-        }
-      }
-      controls.target.copy(camera.position).add(offset);
-      controls.update();
-    };
-
-    const end = () => {
-      active = false;
-    };
-
-    canvas.addEventListener("pointerdown", onPointerDown);
-    window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", end);
-    window.addEventListener("pointercancel", end);
-    return () => {
-      canvas.removeEventListener("pointerdown", onPointerDown);
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", end);
-      window.removeEventListener("pointercancel", end);
-    };
-  }, [gl, camera, controlsRef, rotateSpeed]);
-
-  return null;
-}
-
 // ---- scene ----
+
+// ---------------------------------------------------------------------------
+// Read-only 3D BBox annotation overlay: the AABBs saved for the active asset
+// by the BBox Anno mode (same scene + asset name, same Z-up local frame),
+// drawn as thin wireframes in the annotation palette colors. Silent by
+// design — visible in the scene, but no hover / click / drag (raycasting is
+// disabled so it can never be picked or block picks), no panel, not editable
+// here; edit them in the BBox Anno mode.
+// ---------------------------------------------------------------------------
+
+/** three.js raycast no-op: overlay lines must never intercept picks. */
+const overlayNoRaycast = () => {};
+
+function BBoxAnnotationOverlay({
+  boxes,
+  assocMode,
+  pendingBboxId,
+  onPickBbox,
+  pickable,
+  objects,
+  edgeWidth,
+  fillOpacity,
+}: {
+  boxes: BBoxItem[];
+  /** Association mode: link lines + object labels appear. */
+  assocMode: boolean;
+  /** The box currently awaiting an object click; null = none picked yet. */
+  pendingBboxId: string | null;
+  onPickBbox: (id: string) => void;
+  /** Proxies pickable at all (association OR target-creation mode). */
+  pickable: boolean;
+  objects: SceneObject[];
+  /** Box visuals shared with the BBox Anno mode (3dbbox_ localStorage). */
+  edgeWidth: number;
+  fillOpacity: number;
+}) {
+  const EDGES = boxEdges();
+  const items = useMemo(() => {
+    return boxes.map((b, index) => {
+      const center: [number, number, number] = [
+        (b.min[0] + b.max[0]) / 2,
+        (b.min[1] + b.max[1]) / 2,
+        (b.min[2] + b.max[2]) / 2,
+      ];
+      // Association link: bbox center → owning object (thin blue line).
+      // Rendered only while assocMode is on. If the stored objectId is not in
+      // the current snapshot, no line but the label still shows (id may be
+      // snapshot-dependent — see the plan's Risks section).
+      const obj =
+        b.objectId != null ? objects.find((o) => o.id === b.objectId) : undefined;
+      // Plain position data (no THREE resource): the <bufferGeometry> below is
+      // built declaratively so R3F owns its disposal, instead of a
+      // geometry created here (StrictMode double-invokes useMemo factories and
+      // would leak the discarded one).
+      let linkPositions: Float32Array | null = null;
+      let labelPosition: [number, number, number] | null = null;
+      if (b.objectId != null) {
+        if (obj) {
+          linkPositions = new Float32Array([
+            center[0],
+            center[1],
+            center[2],
+            obj.position[0],
+            obj.position[1],
+            obj.position[2],
+          ]);
+        }
+        labelPosition = [center[0], center[1], b.max[2] + 0.25];
+      }
+      return {
+        key: b.id,
+        box: b,
+        corners: cornerPositions(b.min, b.max),
+        position: center,
+        size: [
+          b.max[0] - b.min[0],
+          b.max[1] - b.min[1],
+          b.max[2] - b.min[2],
+        ] as [number, number, number],
+        color: colorForIndex(index),
+        linkPositions,
+        linkLabel:
+          b.objectId != null
+            ? `${b.objectLabel ?? obj?.label ?? "?"} [${b.objectId}]`
+            : null,
+        labelPosition,
+      };
+    });
+  }, [boxes, objects]);
+
+  const edgeRadius = Math.max(MIN_EDGE_RADIUS, edgeWidth / 2);
+
+  return (
+    <group>
+      {/* Same box look as the BBox Anno mode: 12 edge cylinders + a
+          semi-transparent fill, keyed by the same 3dbbox_ visual params.
+          Everything here is a display-only no-pick (raycast no-op) so the
+          overlay can never intercept node/object picks. */}
+      {items.map((it) => {
+        const pending = pendingBboxId === it.box.id;
+        const edgeColor = pending ? "#ffffff" : it.color;
+        return (
+          <group key={it.key}>
+            {EDGES.map(([a, b], i) => (
+              <EdgeCylinder
+                key={i}
+                start={it.corners[a]!}
+                end={it.corners[b]!}
+                radius={edgeRadius}
+                color={edgeColor}
+                raycast={overlayNoRaycast}
+              />
+            ))}
+            <mesh position={it.position} raycast={overlayNoRaycast}>
+              <boxGeometry args={it.size} />
+              <meshBasicMaterial
+                color={it.color}
+                transparent
+                opacity={fillOpacity}
+                depthWrite={false}
+                side={THREE.DoubleSide}
+              />
+            </mesh>
+          </group>
+        );
+      })}
+      {pickable && (
+        <>
+          {/* Transparent pick proxies. While a box is pending (association
+              flow), ALL proxies stop raycasting so the object click passes
+              through to the object behind the box. Unlinking is NOT done by
+              clicking the box again — that click would never reach the
+              proxy — but via the X key (main component keydown effect). */}
+          {items.map((it) => (
+            <mesh
+              key={`proxy-${it.key}`}
+              position={it.position}
+              onClick={(e) => {
+                e.stopPropagation();
+                onPickBbox(it.box.id);
+              }}
+              raycast={pendingBboxId ? overlayNoRaycast : undefined}
+            >
+              <boxGeometry args={it.size} />
+              <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+            </mesh>
+          ))}
+        </>
+      )}
+      {assocMode && (
+        <>
+          {items.map((it) =>
+            it.linkPositions ? (
+              <lineSegments
+                key={`link-${it.key}`}
+                raycast={overlayNoRaycast}
+              >
+                <bufferGeometry>
+                  <bufferAttribute
+                    attach="attributes-position"
+                    args={[it.linkPositions, 3]}
+                  />
+                </bufferGeometry>
+                <lineBasicMaterial
+                  color="#3498db"
+                  transparent
+                  opacity={0.9}
+                  depthWrite={false}
+                />
+              </lineSegments>
+            ) : null,
+          )}
+          {items.map((it) =>
+            it.linkLabel && it.labelPosition ? (
+              <Html
+                key={`label-${it.key}`}
+                position={it.labelPosition}
+                center
+                style={{
+                  color: "#7fd4ff",
+                  fontSize: 10,
+                  fontFamily: "monospace",
+                  whiteSpace: "nowrap",
+                  pointerEvents: "none",
+                  textShadow: "0 0 4px rgba(0,0,0,0.8)",
+                }}
+              >
+                {it.linkLabel}
+              </Html>
+            ) : null,
+          )}
+        </>
+      )}
+    </group>
+  );
+}
 
 function Scene({
   effectiveNodes: tNodes,
@@ -1078,6 +1160,13 @@ function Scene({
   effectiveAreas,
   effectiveObjects: tObjects,
   layers,
+  bboxAnnotations,
+  assocMode,
+  pendingBboxId,
+  onPickBbox,
+  bboxPickable,
+  bboxEdgeWidth,
+  bboxFillOpacity,
   selectedArea,
   selectedNodeIds,
   selectedEdgeKey,
@@ -1117,6 +1206,14 @@ function Scene({
   effectiveAreas: PreprocessedArea[];
   effectiveObjects: SceneObject[];
   layers: Layers;
+  bboxAnnotations: BBoxItem[] | null;
+  assocMode: boolean;
+  pendingBboxId: string | null;
+  onPickBbox: (id: string) => void;
+  /** Proxies pickable at all (association OR target-creation mode). */
+  bboxPickable: boolean;
+  bboxEdgeWidth: number;
+  bboxFillOpacity: number;
   selectedArea: number | null;
   selectedNodeIds: Set<number>;
   selectedEdgeKey: string | null;
@@ -1208,6 +1305,20 @@ function Scene({
       <group ref={sceneGroupRef} rotation={[-Math.PI / 2, 0, 0]}>
         {showAxes && <WorldAxes />}
         {areaBoxes}
+        {/* Read-only 3D BBox annotations (silent overlay, not pickable
+            outside association mode). */}
+        {bboxAnnotations && bboxAnnotations.length > 0 && (
+          <BBoxAnnotationOverlay
+            boxes={bboxAnnotations}
+            assocMode={assocMode}
+            pendingBboxId={pendingBboxId}
+            objects={tObjects}
+            onPickBbox={onPickBbox}
+            pickable={bboxPickable}
+            edgeWidth={bboxEdgeWidth}
+            fillOpacity={bboxFillOpacity}
+          />
+        )}
         {layers.areaEdges && <AreaEdges areas={effectiveAreas} visible />}
         {layers.areaCenters && (
           <AreaCenters areas={effectiveAreas} visible />
@@ -1332,6 +1443,11 @@ function Scene({
 // byte-identical or already saved settings silently reset.
 const useLocalStorageState = createLocalStorageHook("sge_");
 
+// SAME prefix and keys as the BBox Anno mode's box visuals (3dbbox_lineWidth,
+// 3dbbox_opacity): the silent overlay inherits the exact box look the user
+// tuned over there (read-only here; adjust the look in the BBox Anno mode).
+const useBboxVisualState = createLocalStorageHook("3dbbox_");
+
 export function SceneGraphMode() {
   // Scene-rendering state — the ONE shared implementation (scene bucket,
   // asset listing, selections, render mode, point-cloud loading with the
@@ -1351,6 +1467,7 @@ export function SceneGraphMode() {
     selectedSplat,
     selectSplat,
     activeFormat,
+    activeName,
     activeUrl,
     positions,
     cloudLoading,
@@ -1361,6 +1478,54 @@ export function SceneGraphMode() {
   const [snapshots, setSnapshots] = useState<{ name: string; saved_at: string; summary: any }[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // Read-only 3D BBox annotations saved for the active asset (the same file
+  // the BBox Anno mode edits). Rendered as a silent wireframe overlay in the
+  // Scene — visible, but never pickable/editable here.
+  const [bboxAnnotations, setBboxAnnotations] = useState<BBoxItem[] | null>(null);
+  // BBox ↔ object association mode: when on, clicking a bbox proxy picks the
+  // box (pendingBboxId), then clicking an object associates them (written
+  // straight through to the annotation file). X unlinks the pending box.
+  const [assocMode, setAssocMode] = useState(false);
+  const [pendingBboxId, setPendingBboxId] = useState<string | null>(null);
+  const [copiedPresets, setCopiedPresets] = useState(false);
+  // Pick-a-bbox-to-create-target mode: clicking a bbox opens the AddObject
+  // dialog with the box center prefilled (the typed-coordinates path stays
+  // available in the same dialog — the user can still edit the numbers).
+  const [pickBboxForTarget, setPickBboxForTarget] = useState(false);
+  // Box visuals shared with the BBox Anno mode (3dbbox_ prefix): edge width
+  // and fill opacity of the annotation boxes. Read-only here — the overlay
+  // mirrors whatever the BBox Anno mode persisted.
+  const [bboxEdgeWidth] = useBboxVisualState<number>("lineWidth", 0.04);
+  const [bboxFillOpacity] = useBboxVisualState<number>("opacity", 0.08);
+  useEffect(() => {
+    if (!scene || !activeName) {
+      setBboxAnnotations(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch(
+          `/api/bbox?scene=${encodeURIComponent(scene)}&name=${encodeURIComponent(activeName)}`,
+        );
+        if (resp.status === 404) {
+          if (!cancelled) setBboxAnnotations(null);
+          return;
+        }
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const payload = await resp.json();
+        if (!cancelled) setBboxAnnotations(parseBoxes(payload));
+      } catch {
+        // No saved boxes (or load failed): no overlay.
+        if (!cancelled) setBboxAnnotations(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [scene, activeName]);
+
   const [layers, setLayers] = useState<Layers>({
     areas: true,
     areaEdges: false,
@@ -1672,8 +1837,72 @@ export function SceneGraphMode() {
 
   // ---- object selection ----
 
+  // Bbox ↔ object association helpers: used by handleSelectObject below and
+  // the X-key handler in the keydown effect. Declared here so the selection
+  // callback can capture them.
+
+  // POST the full box list: the backend validates the six numeric fields and
+  // passes object_id/object_label through unchanged (whole-file overwrite).
+  const persistBboxAnnotations = useCallback(
+    async (boxes: BBoxItem[]) => {
+      if (!scene || !activeName) return;
+      try {
+        const resp = await fetch("/api/bbox", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            scene,
+            name: activeName,
+            boxes: boxes.map(toBBoxOutput),
+          }),
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [scene, activeName],
+  );
+
+  const associateBbox = useCallback(
+    (boxId: string, objectId: number) => {
+      if (!bboxAnnotations) return;
+      // Pending (unexported) new objects carry temporary negative ids —
+      // persisting one would write a meaningless id into the file.
+      if (objectId < 0) {
+        setError("请先导出场景图，再关联新建的物体（当前为临时 id）");
+        return;
+      }
+      const obj = data?.objects.find((o) => o.id === objectId);
+      // One object owns at most one bbox: clear any OTHER box already
+      // pointing at this object first — duplicate object ids would become
+      // duplicate Python dict keys in the copied BBOX_PRESETS.
+      const next = bboxAnnotations
+        .map((b) =>
+          b.objectId === objectId && b.id !== boxId
+            ? { ...b, objectId: null, objectLabel: null }
+            : b,
+        )
+        .map((b) =>
+          b.id === boxId
+            ? { ...b, objectId, objectLabel: obj?.label ?? null }
+            : b,
+        );
+      setBboxAnnotations(next);
+      setPendingBboxId(null);
+      void persistBboxAnnotations(next);
+    },
+    [bboxAnnotations, data, persistBboxAnnotations],
+  );
+
   const handleSelectObject = useCallback(
     (id: number, additive: boolean) => {
+      // Association mode: the object click completes a pending bbox→object
+      // association instead of toggling the object selection.
+      if (pendingBboxId) {
+        associateBbox(pendingBboxId, id);
+        return;
+      }
       setSelectedObjectIds((prev) => {
         const next = new Set(additive ? prev : []);
         if (next.has(id)) {
@@ -1688,7 +1917,7 @@ export function SceneGraphMode() {
       if (!additive) setSelectedNodeIds(new Set());
       setSelectedEdgeKey(null);
     },
-    [],
+    [pendingBboxId, associateBbox],
   );
 
   const handleDoubleClickObject = useCallback((id: number) => {
@@ -1719,7 +1948,86 @@ export function SceneGraphMode() {
     setSelectedObjectIds(new Set());
     setPreviewObjectPositions(new Map());
     setPreviewNodePositions(new Map());
+    setPendingBboxId(null);
+    setPickBboxForTarget(false);
   }, []);
+
+  // ---- bbox ↔ object association (unlink / copy / mode toggle) ----
+
+  const unlinkBbox = useCallback(
+    (boxId: string) => {
+      if (!bboxAnnotations) return;
+      const target = bboxAnnotations.find((b) => b.id === boxId);
+      if (!target || target.objectId == null) return;
+      const next = bboxAnnotations.map((b) =>
+        b.id === boxId ? { ...b, objectId: null, objectLabel: null } : b,
+      );
+      setBboxAnnotations(next);
+      setPendingBboxId(null);
+      void persistBboxAnnotations(next);
+    },
+    [bboxAnnotations, persistBboxAnnotations],
+  );
+
+  const handleCopyPresets = useCallback(() => {
+    if (!bboxAnnotations || bboxAnnotations.length === 0) return;
+    const text = formatBboxPresets(bboxAnnotations);
+    const done = () => {
+      setCopiedPresets(true);
+      window.setTimeout(() => setCopiedPresets(false), 2000);
+    };
+    if (navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(text).then(done).catch(done);
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      done();
+    }
+  }, [bboxAnnotations]);
+
+  // State updaters must be pure (StrictMode double-invokes them): clear the
+  // pending box in the handler body instead. The two bbox pick modes are
+  // mutually exclusive — entering one leaves the other.
+  const toggleAssocMode = useCallback(() => {
+    setAssocMode((prev) => !prev);
+    setPendingBboxId(null);
+    setPickBboxForTarget(false);
+  }, []);
+
+  const togglePickBboxForTarget = useCallback(() => {
+    setPickBboxForTarget((prev) => !prev);
+    setAssocMode(false);
+    setPendingBboxId(null);
+  }, []);
+
+  // A bbox proxy was clicked. Association mode: mark it pending (the next
+  // object click completes the association). Target mode: open the AddObject
+  // dialog with the bbox center prefilled — the coordinates stay editable,
+  // so the target can ALSO be created from fully user-specified numbers.
+  const handlePickBbox = useCallback(
+    (id: string) => {
+      if (pickBboxForTarget) {
+        const b = bboxAnnotations?.find((x) => x.id === id);
+        if (!b) return;
+        setPickedPosition([
+          (b.min[0] + b.max[0]) / 2,
+          (b.min[1] + b.max[1]) / 2,
+          (b.min[2] + b.max[2]) / 2,
+        ]);
+        setShowAddPanel(false);
+        setAddMode("object");
+        setShowAddObjectPanel(true);
+        setPickBboxForTarget(false);
+        return;
+      }
+      setPendingBboxId(id);
+    },
+    [pickBboxForTarget, bboxAnnotations],
+  );
 
   // ---- live dragging of nodes / objects ----
 
@@ -1734,12 +2042,12 @@ export function SceneGraphMode() {
   const handleDragCommit = useCallback(
     (kind: "node" | "object", id: number, position: [number, number, number]) => {
       if (kind === "node") {
-        // Pending (unexported) new nodes carry synthetic negative ids: update
-        // their createPoly entry directly — movePoly entries with negative
-        // ids would be silently dropped by the backend on export.
+        // Pending (unexported) new nodes carry their pre-assigned real id:
+        // update their createPoly entry directly — movePoly entries for them
+        // would be silently dropped by the backend on export.
         commitEdit((current) =>
-          id < 0
-            ? addUpdateCreatePolyCenter(current, -id - 1, position)
+          isPendingCreatePoly(current, id)
+            ? addUpdateCreatePolyCenter(current, id, position)
             : addMovePoly(current, id, position),
         );
         clearNodePositionPreview(id);
@@ -1766,17 +2074,8 @@ export function SceneGraphMode() {
     }
 
     const [srcId, dstId] = ids;
-    // New (unexported) nodes have synthetic negative ids — the backend
-    // cannot resolve them until the export assigns real ids, so an edge to
-    // them would be silently dropped. Block with an explicit notice.
-    if (srcId < 0 || dstId < 0) {
-      setConnectionNotice({
-        kind: "error",
-        message: "新建节点需先导出（获得真实 id）后才能连接",
-      });
-      setSelectedNodeIds(new Set());
-      return;
-    }
+    // New (unexported) nodes carry pre-assigned real ids that the backend
+    // honors at export, so edges to them resolve like edges to loaded nodes.
     const key = edgeKey(srcId, dstId);
     const sourceHasEdge =
       data?.topoEdges.some((edge) => edgeKey(edge.srcId, edge.dstId) === key) ??
@@ -1829,13 +2128,13 @@ export function SceneGraphMode() {
     const objectId = objIds[0];
     const fatherPolyId = nodeIds[0];
 
-    // Same synthetic-id guard as handleConnectSelected: connecting to an
-    // unexported new node would export as father_poly_id = -1 (connection
-    // silently dropped) because the backend cannot resolve negative ids.
-    if (objectId < 0 || fatherPolyId < 0) {
+    // Pending (unexported) objects still carry synthetic negative ids the
+    // backend cannot resolve — block those. New nodes carry pre-assigned
+    // real ids, so connecting an object to one works before export.
+    if (objectId < 0) {
       setConnectionNotice({
         kind: "error",
-        message: "新建节点/对象需先导出（获得真实 id）后才能连接",
+        message: "新建对象需先导出（获得真实 id）后才能连接",
       });
       return;
     }
@@ -1940,6 +2239,16 @@ export function SceneGraphMode() {
         return;
       }
 
+      // X in association mode: unlink the pending bbox from its object.
+      // Intercepted BEFORE Escape — a pending box must be clearable first.
+      if (e.key.toLowerCase() === "x" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (assocMode && pendingBboxId) {
+          e.preventDefault();
+          if (!e.repeat) unlinkBbox(pendingBboxId);
+        }
+        return;
+      }
+
       if (e.key === "Escape") {
         handleDeselectAll();
         return;
@@ -1970,12 +2279,12 @@ export function SceneGraphMode() {
           commitEdit((current) => {
             let nextMutations = current;
             for (const nid of selectedNodeIds) {
-              // Synthetic negative ids belong to pending (unexported) nodes:
+              // Pending (unexported) new nodes carry pre-assigned real ids:
               // delete their createPoly entry instead of a dead
               // deletePolyIds entry.
               nextMutations =
-                nid < 0
-                  ? removeCreatePoly(nextMutations, -nid - 1)
+                isPendingCreatePoly(nextMutations, nid)
+                  ? removeCreatePoly(nextMutations, nid)
                   : addDeletePoly(nextMutations, nid);
             }
             return nextMutations;
@@ -2022,12 +2331,15 @@ export function SceneGraphMode() {
     selectedNodeIds,
     selectedEdgeKey,
     selectedObjectIds,
+    assocMode,
+    pendingBboxId,
     handleDeselectAll,
     handleConnectSelected,
     handleConnectObjectToNode,
     handleUndo,
     handleRedo,
     commitEdit,
+    unlinkBbox,
   ]);
 
   // ---- edit mode toggle ----
@@ -2050,6 +2362,12 @@ export function SceneGraphMode() {
       setShowAddObjectPanel(false);
       setAddMode(null);
       setPickedPosition(null);
+      // Bbox association needs the edit-mode picker to complete (object
+      // selection is edit-mode only), so drop any half-open association
+      // flow instead of leaving boxes pickable in view mode.
+      setAssocMode(false);
+      setPendingBboxId(null);
+      setPickBboxForTarget(false);
       setEditMode("view");
     } else {
       // The 3DGS splat is a background layer; keep the render mode as-is.
@@ -2300,6 +2618,13 @@ export function SceneGraphMode() {
       effectiveAreas={effectiveAreas}
       effectiveObjects={previewedTObjects}
       layers={renderedLayers}
+      bboxAnnotations={bboxAnnotations}
+      assocMode={assocMode}
+      pendingBboxId={pendingBboxId}
+      onPickBbox={handlePickBbox}
+      bboxPickable={assocMode || pickBboxForTarget}
+      bboxEdgeWidth={bboxEdgeWidth}
+      bboxFillOpacity={bboxFillOpacity}
       selectedArea={selectedArea}
       selectedNodeIds={selectedNodeIds}
       selectedEdgeKey={selectedEdgeKey}
@@ -2624,6 +2949,109 @@ export function SceneGraphMode() {
               </div>
             </div>
           )}
+
+          {/* BBox annotation association — mark the owning scene-graph object
+              on each saved bbox; the copied BBOX_PRESETS is then keyed by
+              object id with the object name as trailing comment. */}
+          {bboxAnnotations && bboxAnnotations.length > 0 && (
+            <div>
+              <div style={{ margin: "14px 0 8px", borderTop: "1px solid #333" }} />
+              <div style={{ fontSize: 12, color: "#8ab4d8", marginBottom: 6 }}>
+                BBox 标注关联
+              </div>
+              {/* Both pick flows need the edit-mode picker (object selection
+                  is edit-mode only), so they live behind edit mode. */}
+              {editMode === "edit" && (
+                <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+                  <button
+                    type="button"
+                    onClick={toggleAssocMode}
+                    style={{
+                      flex: 1,
+                      background: assocMode
+                        ? "rgba(52,152,219,0.25)"
+                        : "rgba(52,152,219,0.12)",
+                      border: "1px solid rgba(52,152,219,0.5)",
+                      borderRadius: 4,
+                      color: assocMode ? "#fff" : "#8ab4d8",
+                      cursor: "pointer",
+                      fontSize: 11,
+                      padding: "3px 8px",
+                      fontFamily: "monospace",
+                    }}
+                  >
+                    {assocMode ? "退出关联" : "关联 BBox"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={togglePickBboxForTarget}
+                    style={{
+                      flex: 1,
+                      background: pickBboxForTarget
+                        ? "rgba(230,100,30,0.25)"
+                        : "rgba(230,100,30,0.12)",
+                      border: "1px solid rgba(230,100,30,0.5)",
+                      borderRadius: 4,
+                      color: pickBboxForTarget ? "#fff" : "#e8a06a",
+                      cursor: "pointer",
+                      fontSize: 11,
+                      padding: "3px 8px",
+                      fontFamily: "monospace",
+                    }}
+                  >
+                    {pickBboxForTarget ? "取消选框" : "选框建目标"}
+                  </button>
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+                <button
+                  type="button"
+                  onClick={handleCopyPresets}
+                  style={{
+                    flex: 1,
+                    background: "rgba(60,60,60,0.4)",
+                    border: "1px solid #555",
+                    borderRadius: 4,
+                    color: copiedPresets ? "#7fd47f" : "#ccc",
+                    cursor: "pointer",
+                    fontSize: 11,
+                    padding: "3px 8px",
+                    fontFamily: "monospace",
+                  }}
+                >
+                  {copiedPresets ? "已复制" : "复制 BBOX_PRESETS"}
+                </button>
+              </div>
+              {/* Box visual parameters (线条粗细 / 不透明度) are adjusted in the
+                  BBox Anno mode; the overlay here only inherits them. */}
+              {assocMode && (
+                <div
+                  style={{
+                    fontSize: 10,
+                    color: "#9a9aa8",
+                    lineHeight: 1.6,
+                  }}
+                >
+                  点击框 → 点击物体 = 关联；选中框后按 X = 解除关联；Esc 取消
+                  <br />
+                  （关联基于当前快照的 object id；已关联框在 BBox Anno 与复制输出中随之变化）
+                </div>
+              )}
+              {pickBboxForTarget && (
+                <div
+                  style={{
+                    fontSize: 10,
+                    color: "#c9a88a",
+                    lineHeight: 1.6,
+                  }}
+                >
+                  点击一个 3D BBox → 弹出新建目标点（坐标已预填框中心，可改）；Esc 取消
+                  <br />
+                  （目标点坐标两种来源：本工具栏手动输入，或取自 BBox 中心点）
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -2734,8 +3162,8 @@ export function SceneGraphMode() {
                       node={linkedNode}
                       onChangePosition={(id, center) => {
                         commitEdit((current) =>
-                          id < 0
-                            ? addUpdateCreatePolyCenter(current, -id - 1, center)
+                          isPendingCreatePoly(current, id)
+                            ? addUpdateCreatePolyCenter(current, id, center)
                             : addMovePoly(current, id, center),
                         );
                         clearNodePositionPreview(id);
@@ -2743,8 +3171,8 @@ export function SceneGraphMode() {
                       onPreviewPosition={setNodePositionPreview}
                       onDelete={(id) => {
                         commitEdit((current) =>
-                          id < 0
-                            ? removeCreatePoly(current, -id - 1)
+                          isPendingCreatePoly(current, id)
+                            ? removeCreatePoly(current, id)
                             : addDeletePoly(current, id),
                         );
                         setSelectedNodeIds(new Set());
@@ -2760,8 +3188,8 @@ export function SceneGraphMode() {
               node={effectiveTNodes.find((n) => selectedNodeIds.has(n.id))!}
               onChangePosition={(id, center) => {
                 commitEdit((current) =>
-                  id < 0
-                    ? addUpdateCreatePolyCenter(current, -id - 1, center)
+                  isPendingCreatePoly(current, id)
+                    ? addUpdateCreatePolyCenter(current, id, center)
                     : addMovePoly(current, id, center),
                 );
                 clearNodePositionPreview(id);
@@ -2769,8 +3197,8 @@ export function SceneGraphMode() {
               onPreviewPosition={setNodePositionPreview}
               onDelete={(id) => {
                 commitEdit((current) =>
-                  id < 0
-                    ? removeCreatePoly(current, -id - 1)
+                  isPendingCreatePoly(current, id)
+                    ? removeCreatePoly(current, id)
                     : addDeletePoly(current, id),
                 );
                 setSelectedNodeIds(new Set());
@@ -2807,7 +3235,13 @@ export function SceneGraphMode() {
           initialPosition={pickedPosition ?? undefined}
           onAdd={(areaId, x, y, z, size) => {
             commitEdit((current) =>
-              addCreatePoly(current, areaId, [x, y, z], size),
+              addCreatePoly(
+                current,
+                nextPolyId(data?.topoNodes ?? [], current),
+                areaId,
+                [x, y, z],
+                size,
+              ),
             );
             setShowAddPanel(false);
             setAddMode(null);
@@ -2863,8 +3297,11 @@ export function SceneGraphMode() {
           data-overlay
           style={{
             ...FLOATING_OVERLAY,
-            bottom: 16,
-            right: 16,
+            // Bottom-center; raised above the transient "2 nodes selected"
+            // hint bar (bottom 16) so the two never overlap.
+            bottom: 56,
+            left: "50%",
+            transform: "translateX(-50%)",
             zIndex: 10,
             borderRadius: 8,
             padding: "14px 18px",
