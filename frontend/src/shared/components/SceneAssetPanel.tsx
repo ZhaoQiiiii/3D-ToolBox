@@ -193,6 +193,24 @@ export function SceneAssetPanel({
       ? [selectedSplat, ...splatFiles]
       : splatFiles;
 
+  const [openFolderNotice, setOpenFolderNotice] = useState<string | null>(null);
+  const handleOpenFolder = async () => {
+    if (!selectedScene) return;
+    setOpenFolderNotice(null);
+    try {
+      const resp = await fetch(
+        `/api/open-folder?scene=${encodeURIComponent(selectedScene)}`,
+        { method: "POST" },
+      );
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => null);
+        throw new Error(body?.error || `HTTP ${resp.status}`);
+      }
+    } catch (e) {
+      setOpenFolderNotice(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   return (
     <div data-overlay style={PANEL}>
       <div
@@ -223,6 +241,32 @@ export function SceneAssetPanel({
           </option>
         ))}
       </select>
+
+      <button
+        type="button"
+        onClick={handleOpenFolder}
+        disabled={!selectedScene}
+        style={{
+          width: "100%",
+          marginBottom: 8,
+          background: "rgba(52,152,219,0.12)",
+          border: "1px solid rgba(52,152,219,0.5)",
+          borderRadius: 6,
+          color: "#8ab4d8",
+          cursor: selectedScene ? "pointer" : "not-allowed",
+          opacity: selectedScene ? 1 : 0.5,
+          fontSize: 12,
+          padding: "4px 8px",
+          fontFamily: "monospace",
+        }}
+      >
+        打开场景文件夹
+      </button>
+      {openFolderNotice && (
+        <div style={{ color: "#ff7b7b", marginBottom: 8, fontSize: 12 }}>
+          {openFolderNotice}
+        </div>
+      )}
 
       {renderMode === "pointcloud" ? (
         <>

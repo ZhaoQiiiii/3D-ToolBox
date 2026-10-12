@@ -16,6 +16,7 @@
  * - GET  /api/pcd?scene=X&name=elec.ply       → stream a scene asset
  * - GET  /api/bbox?scene=X&name=elec.ply      → load saved labelled boxes
  * - POST /api/bbox                            → persist boxes ({scene,name,boxes})
+ * - POST /api/open-folder?scene=X             → reveal scene dir in the file manager
  *
  * ── SceneGraph edit mode ──────────────────────────────────────────────
  * - GET  /api/scene-pcds?scene=X                      → alias of pointcloud-files
@@ -57,6 +58,7 @@ import {
 } from "node:fs";
 import { copyFile, mkdir } from "node:fs/promises";
 import { join, dirname, resolve, basename, isAbsolute, sep } from "node:path";
+import { spawn } from "node:child_process";
 import type {
   MovePoly,
   EdgeRef,
@@ -352,9 +354,12 @@ function applyMutations(root: any, mutations: Mutations): UpdateObjectId[] {
   applyDeleteAreas(root, mutations.deleteAreaIds);
   applyUpdateAreas(root, mutations.updateAreas);
   applyMovePolys(root, mutations.movePoly);
+  // Creates must run before edge mutations: new polys carry pre-assigned ids
+  // that pending addEdges may already reference, and applyAddEdges drops
+  // edges whose endpoints are not in polyMap yet.
+  applyCreatePolys(root, mutations.createPoly);
   applyRemoveEdges(root, mutations.removeEdges);
   applyAddEdges(root, mutations.addEdges);
-  applyCreatePolys(root, mutations.createPoly);
   applyCreateObjects(root, mutations.createObjects);
   // Object id renames run first — the frontend rewrites all other object
   // mutations to reference the new id, so they must run after the rename.
@@ -602,8 +607,10 @@ function applyCreatePolys(root: any, creates: CreatePoly[]): void {
   if (creates.length === 0) return;
 
   let maxPolyId = 0;
+  const usedPolyIds = new Set<number>();
   for (const p of root.polyhedrons || []) {
     maxPolyId = Math.max(maxPolyId, Number(p.id));
+    usedPolyIds.add(Number(p.id));
   }
   let maxVertexId = 0;
   for (const v of root.vertices || []) {
@@ -618,8 +625,19 @@ function applyCreatePolys(root: any, creates: CreatePoly[]): void {
   for (const a of root.areas || []) areaMap.set(Number(a.id), a);
 
   for (const cp of creates) {
-    maxPolyId += 1;
-    const polyId = maxPolyId;
+    // Honor the id pre-assigned by the frontend (max loaded id + 1, +2, …)
+    // so pending edges / father_poly updates referencing it resolve. Fall
+    // back to max+1 for missing or colliding ids (legacy mutations).
+    const wanted = Number(cp.id);
+    let polyId: number;
+    if (Number.isInteger(wanted) && wanted > 0 && !usedPolyIds.has(wanted)) {
+      polyId = wanted;
+    } else {
+      maxPolyId += 1;
+      polyId = maxPolyId;
+    }
+    usedPolyIds.add(polyId);
+    maxPolyId = Math.max(maxPolyId, polyId);
 
     const s = cp.size * 0.5;
     const cx = cp.center[0], cy = cp.center[1], cz = cp.center[2];
@@ -1271,6 +1289,63 @@ export function apiPlugin(): Plugin {
               .map((e) => ({ name: e.name }))
               .sort((a, b) => a.name.localeCompare(b.name));
             sendJson(res, 200, { scenes });
+          } catch (err: any) {
+            sendJson(res, 500, { success: false, error: err.message });
+          }
+        },
+      );
+
+      // Reveal the active scene directory in the OS file manager. The dev
+      // server runs on the same host as the browser (local tool), so shelling
+      // out to the platform opener is what lets the user jump from the UI to
+      // the folder on disk. Scoped to scenes/<scene>/ like every other route.
+      server.middlewares.use(
+        "/api/open-folder",
+        async (req: IncomingMessage, res: ServerResponse) => {
+          if (req.method !== "POST") {
+            sendJson(res, 405, { success: false, error: "Method not allowed" });
+            return;
+          }
+          try {
+            const url = new URL(
+              req.url || "",
+              `http://${req.headers.host || "localhost"}`,
+            );
+            const scene = url.searchParams.get("scene");
+            if (!isValidSceneName(scene)) {
+              sendJson(res, 400, { success: false, error: "Missing/invalid scene" });
+              return;
+            }
+            const dir = join(SCENES_ROOT, scene);
+            let st;
+            try {
+              st = statSync(dir);
+            } catch {
+              sendJson(res, 404, { success: false, error: "Scene folder not found" });
+              return;
+            }
+            if (!st.isDirectory()) {
+              sendJson(res, 400, { success: false, error: "Not a directory" });
+              return;
+            }
+            const opener =
+              process.platform === "darwin"
+                ? "open"
+                : process.platform === "win32"
+                  ? "explorer"
+                  : "xdg-open";
+            await new Promise<void>((resolvePromise, reject) => {
+              const child = spawn(opener, [dir], {
+                detached: true,
+                stdio: "ignore",
+              });
+              child.once("error", reject);
+              child.once("spawn", () => {
+                child.unref();
+                resolvePromise();
+              });
+            });
+            sendJson(res, 200, { success: true, path: dir });
           } catch (err: any) {
             sendJson(res, 500, { success: false, error: err.message });
           }
