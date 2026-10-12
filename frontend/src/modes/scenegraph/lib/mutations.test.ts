@@ -7,51 +7,62 @@ import {
   addUpdateCreateObjectPosition,
   addUpdateCreatePolyCenter,
   emptyMutations,
+  isPendingCreatePoly,
   removeCreateObject,
   removeCreatePoly,
 } from "./mutations";
 
-// Pending (unexported) entries carry synthetic negative display ids:
-// createPoly[k] renders as node id -(k+1), createObjects[k] as object id
-// -(k+1). These tests cover the helpers that edit/delete those entries.
+// Pending (unexported) createPoly entries carry pre-assigned real poly ids
+// (max loaded id + 1, +2, …) so nodes are connectable before export.
+// createObjects entries still use synthetic negative display ids: entry k
+// renders as object id -(k+1). These tests cover the helpers that edit or
+// delete those entries.
 
 describe("pending createPoly helpers", () => {
   test("addUpdateCreatePolyCenter rewrites the entry's center", () => {
     let m = emptyMutations();
-    m = addCreatePoly(m, 3, [1, 2, 3], 0.5);
-    m = addUpdateCreatePolyCenter(m, 0, [9, 8, 7]);
+    m = addCreatePoly(m, 11, 3, [1, 2, 3], 0.5);
+    m = addUpdateCreatePolyCenter(m, 11, [9, 8, 7]);
 
     expect(m.createPoly.length).toBe(1);
+    expect(m.createPoly[0]!.id).toBe(11);
     expect(m.createPoly[0]!.center).toEqual([9, 8, 7]);
     expect(m.createPoly[0]!.areaId).toBe(3);
     expect(m.createPoly[0]!.size).toBe(0.5);
   });
 
-  test("addUpdateCreatePolyCenter ignores out-of-range indices", () => {
+  test("addUpdateCreatePolyCenter ignores unknown ids", () => {
     let m = emptyMutations();
-    m = addCreatePoly(m, 1, [0, 0, 0], 0.5);
+    m = addCreatePoly(m, 11, 1, [0, 0, 0], 0.5);
 
-    expect(addUpdateCreatePolyCenter(m, -1, [1, 1, 1])).toEqual(m);
-    expect(addUpdateCreatePolyCenter(m, 5, [1, 1, 1])).toEqual(m);
+    expect(addUpdateCreatePolyCenter(m, 12, [1, 1, 1])).toEqual(m);
   });
 
   test("removeCreatePoly drops the entry and stale movePoly references", () => {
     let m = emptyMutations();
-    m = addCreatePoly(m, 1, [0, 0, 0], 0.5); // synthetic id -1
-    m = addCreatePoly(m, 2, [1, 0, 0], 0.5); // synthetic id -2
-    m = addMovePolySynthetic(m, -2, [5, 5, 5]);
+    m = addCreatePoly(m, 11, 1, [0, 0, 0], 0.5);
+    m = addCreatePoly(m, 12, 2, [1, 0, 0], 0.5);
+    m = addMovePolySynthetic(m, 12, [5, 5, 5]);
 
-    m = removeCreatePoly(m, 1); // remove the second entry (id -2)
+    m = removeCreatePoly(m, 12);
 
     expect(m.createPoly.length).toBe(1);
     expect(m.createPoly[0]!.center).toEqual([0, 0, 0]);
-    // The stale movePoly for the removed synthetic id must be gone.
+    // The stale movePoly for the removed id must be gone.
     expect(m.movePoly).toHaveLength(0);
   });
 
-  test("removeCreatePoly ignores out-of-range indices", () => {
+  test("removeCreatePoly ignores unknown ids", () => {
     const m = emptyMutations();
-    expect(removeCreatePoly(m, 0)).toEqual(m);
+    expect(removeCreatePoly(m, 11)).toEqual(m);
+  });
+
+  test("isPendingCreatePoly matches only pre-assigned ids", () => {
+    let m = emptyMutations();
+    m = addCreatePoly(m, 11, 1, [0, 0, 0], 0.5);
+
+    expect(isPendingCreatePoly(m, 11)).toBe(true);
+    expect(isPendingCreatePoly(m, 12)).toBe(false);
   });
 });
 
@@ -121,7 +132,7 @@ describe("pending createObjects helpers", () => {
   });
 });
 
-// Build a movePoly entry pointing at a synthetic negative id directly (the
+// Build a movePoly entry pointing at a pending createPoly id directly (the
 // component never creates these through addMovePoly, but removeCreatePoly
 // defensively cleans them up).
 function addMovePolySynthetic(

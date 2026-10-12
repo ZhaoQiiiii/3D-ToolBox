@@ -93,6 +93,12 @@ export interface EdgeRef {
 }
 
 export interface CreatePoly {
+  /**
+   * Real poly id pre-assigned at creation time (max loaded id + 1, +2, …).
+   * The backend uses this id at export, so the node is connectable
+   * (edges / object re-parents) before being exported.
+   */
+  id: number;
   areaId: number;
   center: [number, number, number];
   size: number;

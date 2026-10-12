@@ -120,13 +120,19 @@ export function addAddEdge(m: Mutations, e: EdgeRef): Mutations {
 
 export function addCreatePoly(
   m: Mutations,
+  id: number,
   areaId: number,
   center: [number, number, number],
   size: number,
 ): Mutations {
   const n = shallowCopy(m);
-  n.createPoly = [...n.createPoly, { areaId, center: [...center] as [number, number, number], size }];
+  n.createPoly = [...n.createPoly, { id, areaId, center: [...center] as [number, number, number], size }];
   return n;
+}
+
+/** True when `id` belongs to a pending (unexported) createPoly entry. */
+export function isPendingCreatePoly(m: Mutations, id: number): boolean {
+  return m.createPoly.some((cp) => cp.id === id);
 }
 
 /** Append a new marker object (no point cloud, father_poly_id = -1). */
@@ -168,17 +174,17 @@ export function addUpdateCreateObjectPosition(
 }
 
 /**
- * Move a pending createPoly entry (identified by its display index, i.e. the
- * synthetic negative node id from effectiveNodes) while it has not yet been
- * exported to a real poly id.
+ * Move a pending createPoly entry (identified by its pre-assigned real poly
+ * id) while it has not yet been exported.
  */
 export function addUpdateCreatePolyCenter(
   m: Mutations,
-  index: number,
+  id: number,
   center: [number, number, number],
 ): Mutations {
   const n = shallowCopy(m);
-  if (index < 0 || index >= n.createPoly.length) return n;
+  const index = n.createPoly.findIndex((cp) => cp.id === id);
+  if (index < 0) return m;
   n.createPoly[index] = {
     ...n.createPoly[index],
     center: [...center] as [number, number, number],
@@ -214,15 +220,14 @@ export function addUpdateCreateObjectColor(
 }
 
 /** Drop a pending createPoly entry (deleting an unexported new node). */
-export function removeCreatePoly(m: Mutations, index: number): Mutations {
+export function removeCreatePoly(m: Mutations, id: number): Mutations {
   const n = shallowCopy(m);
-  if (index < 0 || index >= n.createPoly.length) return n;
-  n.createPoly = n.createPoly.filter((_, i) => i !== index);
-  // Later entries shift down; drop any stale movePoly entries that still
-  // reference the removed synthetic id (defensive — entry points route
-  // synthetic ids to createPoly updates instead of movePoly).
-  const removedId = -(index + 1);
-  n.movePoly = n.movePoly.filter((mp) => mp.id !== removedId);
+  if (!n.createPoly.some((cp) => cp.id === id)) return m;
+  n.createPoly = n.createPoly.filter((cp) => cp.id !== id);
+  // Drop any stale movePoly entries that still reference the removed id
+  // (defensive — entry points route pending ids to createPoly updates
+  // instead of movePoly).
+  n.movePoly = n.movePoly.filter((mp) => mp.id !== id);
   return n;
 }
 
@@ -393,7 +398,7 @@ function shallowCopy(m: Mutations): Mutations {
     movePoly: m.movePoly.map((x) => ({ ...x })),
     removeEdges: m.removeEdges.map((x) => ({ ...x })),
     addEdges: m.addEdges.map((x) => ({ ...x })),
-    createPoly: m.createPoly.map((x) => ({ areaId: x.areaId, center: [...x.center] as [number, number, number], size: x.size })),
+    createPoly: m.createPoly.map((x) => ({ id: x.id, areaId: x.areaId, center: [...x.center] as [number, number, number], size: x.size })),
     createObjects: m.createObjects.map((x) => ({
       label: x.label,
       position: [...x.position] as [number, number, number],
