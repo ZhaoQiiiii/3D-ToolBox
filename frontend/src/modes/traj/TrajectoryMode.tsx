@@ -19,6 +19,10 @@ import { type SplatFormat } from "../../shared/splat-format";
 import { useSceneAssets } from "../../shared/use-scene-assets";
 import { useCanvasSlot } from "../../shared/canvas-slot";
 import { useSceneCameraPose } from "../../shared/use-scene-camera";
+import {
+  FlyWheelController,
+  LookRotateController,
+} from "../../shared/fly-camera-controllers";
 import { useSceneVisuals } from "../../shared/use-scene-visuals";
 import {
   Y_UP,
@@ -518,6 +522,7 @@ function TrajScene(p: TrajSceneProps) {
   // ONE camera pose across all three modes: restore on mount, track live.
   useSceneCameraPose();
   const sceneGroupRef = useRef<THREE.Group>(null);
+  const controlsRef = useRef<any>(null);
   const raycaster = useMemo(() => new THREE.Raycaster(), []);
   const ndc = useMemo(() => new THREE.Vector2(), []);
 
@@ -677,12 +682,17 @@ function TrajScene(p: TrajSceneProps) {
         far={2000}
       />
       <OrbitControls
+        ref={controlsRef}
         makeDefault
         enableDamping
         dampingFactor={0.1}
-        minDistance={0.5}
-        maxDistance={300}
+        enableZoom={false}
+        rotateSpeed={1.5}
       />
+      {/* Shared fly/look navigation — identical cursor behavior across all
+          three modes (see shared/fly-camera-controllers.tsx). */}
+      <FlyWheelController controlsRef={controlsRef} />
+      <LookRotateController controlsRef={controlsRef} />
       <SceneGrid size={p.gridSize} />
       {/* Z-up local frame (matches the trajectory + cloud conventions). */}
       <group ref={sceneGroupRef} rotation={[-Math.PI / 2, 0, 0]}>
