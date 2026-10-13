@@ -20,25 +20,29 @@ bun test frontend/src/modes/bbox/lib/bbox.test.ts   # single file
 bun test -t "describe or test name"                 # single test
 ```
 
+Tests are colocated as `*.test.ts` next to the code under each `modes/*/lib/`
+and `shared/` — add new ones there.
+
 No ESLint / Prettier / pre-commit / CI is configured. `tsconfig` does **not**
 set `noUnusedLocals`, so unused imports will not fail the build — clean them up
 manually.
 
 ## Architecture (non-obvious)
 
-- **One persistent WebGL `<Canvas>` at `frontend/src/App.tsx`**, never per-mode.
+- **One persistent WebGL `<Canvas>` in `frontend/src/App.tsx`**, never per-mode.
   Modes are lazily-loaded DOM subtrees that push 3D content into the shared
   canvas through `useCanvasSlot` (`shared/canvas-slot.tsx`). Unmounting a
   `Canvas` force-loses the WebGL context and destroys 3DGS textures / point-cloud
   GPU buffers — do **not** add a second `<Canvas>` or call R3F hooks from the DOM
-  side.
+  side. Active mode deep-links via URL hash `#mode=bbox|scenegraph|traj`, which
+  wins over the stored `3dbbox_appMode`.
 - Shared cross-mode state lives in `shared/`: `use-scene-camera` (one camera
   pose across modes), `use-scene-visuals` (point size / grid / axes / color
   scheme), `fly-camera-controllers` (wheel=fly, left-drag=FPS look in all modes;
   OrbitControls' own rotate/zoom are disabled). Entry point is `main.tsx` → `App`.
-- **Backend is a Vite dev-server plugin** (`backend/api-plugin.ts`), not a
-  standalone process. REST routes (`/api/scenes`, `/api/pcd`, `/api/bbox`,
-  `/api/scene-graph`, `/api/snapshots`, `/api/export`, `/api/traj-*`, `/api/log`)
+- **Backend is a Vite dev-server plugin** (`backend/api-plugin.ts`, one ~2000-line
+  file), not a standalone process. The canonical route index is the header
+  comment at the top of that file — read it before touching endpoints; routes
   only exist under `bun run dev`/`preview`. `vite build` emits a static SPA with
   **no** API — don't expect the built `dist/` to serve data.
 - Data lives under `scenes/<scene>/`: `bboxes/<asset>.json`,
