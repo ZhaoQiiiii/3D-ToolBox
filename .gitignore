@@ -26,9 +26,8 @@ logs/
 scenes/*
 !scenes/.gitkeep
 
-# IDE local config (TRAE)
-.trae/
-
 # OS junk
 .DS_Store
 Thumbs.db
+
+/plans
