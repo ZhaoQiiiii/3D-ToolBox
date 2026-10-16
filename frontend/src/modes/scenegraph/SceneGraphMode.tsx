@@ -1165,6 +1165,7 @@ function Scene({
   pendingBboxId,
   onPickBbox,
   bboxPickable,
+  bboxVisible,
   bboxEdgeWidth,
   bboxFillOpacity,
   selectedArea,
@@ -1212,6 +1213,8 @@ function Scene({
   onPickBbox: (id: string) => void;
   /** Proxies pickable at all (association OR target-creation mode). */
   bboxPickable: boolean;
+  /** Overlay drawn at all: the show switch, forced on by either pick mode. */
+  bboxVisible: boolean;
   bboxEdgeWidth: number;
   bboxFillOpacity: number;
   selectedArea: number | null;
@@ -1307,7 +1310,9 @@ function Scene({
         {areaBoxes}
         {/* Read-only 3D BBox annotations (silent overlay, not pickable
             outside association mode). */}
-        {bboxAnnotations && bboxAnnotations.length > 0 && (
+        {bboxAnnotations &&
+          bboxAnnotations.length > 0 &&
+          bboxVisible && (
           <BBoxAnnotationOverlay
             boxes={bboxAnnotations}
             assocMode={assocMode}
@@ -1525,6 +1530,10 @@ export function SceneGraphMode() {
       cancelled = true;
     };
   }, [scene, activeName]);
+
+  // "Show BBox" visibility switch for the read-only overlay. Persisted under
+  // the SceneGraph display prefix (sge_) so it survives reloads/mode switches.
+  const [showBbox, setShowBbox] = useLocalStorageState<boolean>("showBbox", true);
 
   const [layers, setLayers] = useState<Layers>({
     areas: true,
@@ -2003,6 +2012,20 @@ export function SceneGraphMode() {
     setAssocMode(false);
     setPendingBboxId(null);
   }, []);
+
+  // Hide/show the read-only bbox overlay. Hiding closes the two bbox pick
+  // modes (they are meaningless with no visible boxes); the render condition
+  // also re-forces visibility whenever either mode is active, so the reverse
+  // path (re-entering a pick mode while hidden) stays consistent.
+  const toggleShowBbox = useCallback(() => {
+    const next = !showBbox;
+    setShowBbox(next);
+    if (!next) {
+      setAssocMode(false);
+      setPendingBboxId(null);
+      setPickBboxForTarget(false);
+    }
+  }, [showBbox, setShowBbox]);
 
   // A bbox proxy was clicked. Association mode: mark it pending (the next
   // object click completes the association). Target mode: open the AddObject
@@ -2623,6 +2646,7 @@ export function SceneGraphMode() {
       pendingBboxId={pendingBboxId}
       onPickBbox={handlePickBbox}
       bboxPickable={assocMode || pickBboxForTarget}
+      bboxVisible={showBbox || assocMode || pickBboxForTarget}
       bboxEdgeWidth={bboxEdgeWidth}
       bboxFillOpacity={bboxFillOpacity}
       selectedArea={selectedArea}
@@ -2959,6 +2983,28 @@ export function SceneGraphMode() {
               <div style={{ fontSize: 12, color: "#8ab4d8", marginBottom: 6 }}>
                 BBox 标注关联
               </div>
+              {/* Overlay visibility switch — independent of edit mode (useful
+                  for read-only viewing too). */}
+              <button
+                type="button"
+                onClick={toggleShowBbox}
+                style={{
+                  width: "100%",
+                  background: showBbox
+                    ? "rgba(52,152,219,0.25)"
+                    : "rgba(52,152,219,0.12)",
+                  border: "1px solid rgba(52,152,219,0.5)",
+                  borderRadius: 4,
+                  color: showBbox ? "#fff" : "#8ab4d8",
+                  cursor: "pointer",
+                  fontSize: 11,
+                  padding: "3px 8px",
+                  fontFamily: "monospace",
+                  marginBottom: 6,
+                }}
+              >
+                {showBbox ? "隐藏 BBox" : "显示 BBox"}
+              </button>
               {/* Both pick flows need the edit-mode picker (object selection
                   is edit-mode only), so they live behind edit mode. */}
               {editMode === "edit" && (
