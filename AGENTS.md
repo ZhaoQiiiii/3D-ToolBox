@@ -4,6 +4,12 @@
 editing, trajectory visualization) on React Three Fiber / Three.js + 3DGS. This
 repo has its own history; the parent workspace and its `AGENTS.md` are separate.
 
+## Tech Stack
+
+- TypeScript 5.7 + React 19 (React Three Fiber 9, drei 10), three.js 0.170.
+- `@mkkellogg/gaussian-splats-3d` 0.4 for 3DGS; Vite 6 for the dev server, backend plugin and build.
+- Bun is the package manager and test runner (`bun:test`).
+
 ## Commands
 
 Canonical package manager is **Bun** (`bun.lock`). `package-lock.json` is a
